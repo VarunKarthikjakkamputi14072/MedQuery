@@ -1,6 +1,7 @@
-"""Document upload, embedding, listing, and deletion endpoints."""
+"""Document upload, embedding, extraction, listing, and deletion endpoints."""
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import List
 
@@ -14,6 +15,7 @@ from fastapi import (
     UploadFile,
     status,
 )
+from sqlalchemy import delete as sa_delete
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -25,6 +27,7 @@ from app.api.deps import (
 )
 from app.core.config import get_settings
 from app.models.document import Document
+from app.models.entity import Entity
 from app.schemas.document import (
     DOCUMENT_TYPES,
     DocumentRead,
@@ -32,16 +35,26 @@ from app.schemas.document import (
     EmbedResponse,
     UploadResponse,
 )
+from app.schemas.entity import EntityRead, ExtractResponse
 from app.services.embeddings import EmbeddingProvider
+from app.services.entity_extraction import extract_entities, summarize_entities
 from app.services.storage import LocalStorage
-from app.services.text_extraction import extract_text, split_chunks
-from app.services.vector_store import VectorRecord, VectorStore
+from app.services.text_extraction import ScannedPdfError, extract_text, split_chunks
+from app.services.vector_store import (
+    PINECONE_FREE_TIER_LIMIT,
+    VectorRecord,
+    VectorStore,
+)
+
+logger = logging.getLogger(__name__)
 
 documents_router = APIRouter(prefix="/documents", tags=["documents"])
 upload_router = APIRouter(tags=["documents"])
 embed_router = APIRouter(tags=["documents"])
+extract_router = APIRouter(tags=["documents"])
 
 ALLOWED_EXTENSIONS = {".pdf", ".txt"}
+PINECONE_WARN_RATIO = 0.9
 
 
 def _validate_upload(file: UploadFile, size: int) -> None:
@@ -87,6 +100,24 @@ async def get_document(
     return DocumentRead.model_validate(document)
 
 
+@documents_router.get("/{document_id}/entities", response_model=List[EntityRead])
+async def list_document_entities(
+    document_id: str,
+    session: AsyncSession = Depends(session_dep),
+) -> List[EntityRead]:
+    document = await session.get(Document, document_id)
+    if not document:
+        raise HTTPException(status_code=404, detail="Document not found")
+    rows = (
+        await session.execute(
+            select(Entity)
+            .where(Entity.document_id == document_id)
+            .order_by(Entity.entity_type, Entity.entity_text)
+        )
+    ).scalars().all()
+    return [EntityRead.model_validate(e) for e in rows]
+
+
 @documents_router.delete("/{document_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_document(
     document_id: str,
@@ -104,6 +135,10 @@ async def delete_document(
     if document.storage_path:
         await storage.delete(document.storage_path)
 
+    # Cascade-delete entities (works on both Postgres FK ON DELETE CASCADE and
+    # SQLite where the FK isn't enforced).
+    await session.execute(sa_delete(Entity).where(Entity.document_id == document_id))
+
     await session.delete(document)
     await session.commit()
     return Response(status_code=status.HTTP_204_NO_CONTENT)
@@ -120,11 +155,15 @@ async def upload_document(
     data = await file.read()
     _validate_upload(file, len(data))
 
-    storage_path, size_bytes = await storage.save(file.filename or "upload.bin", data)
+    try:
+        pages = await extract_text(file.filename or "upload.bin", data)
+    except ScannedPdfError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
 
-    pages = await extract_text(file.filename or "upload.bin", data)
     chunks = split_chunks(pages)
     preview = "\n\n".join(c.text for c in chunks[:1])[:600]
+
+    storage_path, size_bytes = await storage.save(file.filename or "upload.bin", data)
 
     document = Document(
         filename=file.filename or "upload.bin",
@@ -158,10 +197,38 @@ async def embed_document(
         raise HTTPException(status_code=410, detail="Stored file no longer exists")
 
     data = path.read_bytes()
-    pages = await extract_text(document.filename, data)
+    try:
+        pages = await extract_text(document.filename, data)
+    except ScannedPdfError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+
     chunks = split_chunks(pages)
     if not chunks:
         raise HTTPException(status_code=422, detail="No text extracted from document")
+
+    # Pinecone free-tier cap warning. Soft-block when adding these vectors
+    # would push us over the 100k vector ceiling.
+    try:
+        current_count = await vector_store.count()
+    except Exception:  # pragma: no cover - defensive
+        current_count = 0
+    warning: str | None = None
+    projected = current_count + len(chunks)
+    if projected > PINECONE_FREE_TIER_LIMIT:
+        raise HTTPException(
+            status_code=507,
+            detail=(
+                f"Embedding this document would push the Pinecone index to "
+                f"{projected} vectors, over the free-tier limit of "
+                f"{PINECONE_FREE_TIER_LIMIT}."
+            ),
+        )
+    if projected > PINECONE_FREE_TIER_LIMIT * PINECONE_WARN_RATIO:
+        warning = (
+            f"Approaching Pinecone free-tier limit: {projected}/"
+            f"{PINECONE_FREE_TIER_LIMIT} vectors after this upsert."
+        )
+        logger.warning(warning)
 
     vectors = await embedder.embed([c.text for c in chunks])
     records: list[VectorRecord] = []
@@ -196,4 +263,51 @@ async def embed_document(
         document_id=document.id,
         chunk_count=document.chunk_count,
         pinecone_ids=pinecone_ids,
+        warning=warning,
+    )
+
+
+@extract_router.post("/extract", response_model=ExtractResponse)
+async def extract_document_entities(
+    payload: EmbedRequest,
+    session: AsyncSession = Depends(session_dep),
+) -> ExtractResponse:
+    """Run medical entity extraction (spaCy / scispaCy with regex fallback)."""
+    document = await session.get(Document, payload.document_id)
+    if not document:
+        raise HTTPException(status_code=404, detail="Document not found")
+
+    path = Path(document.storage_path)
+    if not path.exists():
+        raise HTTPException(status_code=410, detail="Stored file no longer exists")
+
+    data = path.read_bytes()
+    try:
+        pages = await extract_text(document.filename, data)
+    except ScannedPdfError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+
+    full_text = "\n\n".join(text for _, text in pages)
+    extracted = extract_entities(full_text)
+
+    # Re-extract: wipe stale entities for this document, store the fresh set.
+    await session.execute(sa_delete(Entity).where(Entity.document_id == document.id))
+    rows: List[Entity] = []
+    for ent in extracted:
+        row = Entity(
+            document_id=document.id,
+            entity_type=ent.entity_type,
+            entity_text=ent.entity_text[:512],
+            confidence=float(ent.confidence),
+        )
+        session.add(row)
+        rows.append(row)
+    await session.commit()
+    for row in rows:
+        await session.refresh(row)
+
+    return ExtractResponse(
+        document_id=document.id,
+        entities=[EntityRead.model_validate(r) for r in rows],
+        summary=summarize_entities(extracted),
     )

@@ -6,6 +6,7 @@ import math
 from typing import List, Protocol
 
 from app.core.config import get_settings
+from app.services.retry import retry_async
 
 EMBEDDING_DIM = 1536  # text-embedding-3-small dimensionality.
 
@@ -27,7 +28,6 @@ class FakeEmbeddingProvider:
 
     def _vector(self, text: str) -> List[float]:
         digest = hashlib.sha256(text.encode("utf-8")).digest()
-        # Expand digest deterministically up to EMBEDDING_DIM floats.
         floats: List[float] = []
         seed = digest
         while len(floats) < self.dimension:
@@ -42,7 +42,7 @@ class FakeEmbeddingProvider:
 
 
 class OpenAIEmbeddingProvider:
-    """Wraps the OpenAI embeddings endpoint."""
+    """Wraps the OpenAI embeddings endpoint with exponential backoff."""
 
     dimension = EMBEDDING_DIM
 
@@ -55,8 +55,14 @@ class OpenAIEmbeddingProvider:
     async def embed(self, texts: List[str]) -> List[List[float]]:
         if not texts:
             return []
-        response = await self._client.embeddings.create(model=self._model, input=texts)
-        return [item.embedding for item in response.data]
+
+        async def _call() -> List[List[float]]:
+            response = await self._client.embeddings.create(
+                model=self._model, input=texts
+            )
+            return [item.embedding for item in response.data]
+
+        return await retry_async(_call, label="openai.embeddings")
 
 
 def get_embedding_provider() -> EmbeddingProvider:

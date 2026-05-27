@@ -1,12 +1,16 @@
 """Vector store abstraction backed by Pinecone, with an in-memory fallback."""
 from __future__ import annotations
 
+import asyncio
 import math
 from dataclasses import dataclass, field
 from threading import RLock
 from typing import Any, Dict, List, Optional, Protocol
 
 from app.core.config import get_settings
+
+PINECONE_UPSERT_BATCH = 100
+PINECONE_FREE_TIER_LIMIT = 100_000
 
 
 @dataclass
@@ -35,12 +39,18 @@ class VectorStore(Protocol):
 
     async def delete(self, ids: List[str]) -> None: ...
 
+    async def count(self) -> int: ...
+
 
 def _cosine(a: List[float], b: List[float]) -> float:
     dot = sum(x * y for x, y in zip(a, b))
     na = math.sqrt(sum(x * x for x in a)) or 1.0
     nb = math.sqrt(sum(y * y for y in b)) or 1.0
     return dot / (na * nb)
+
+
+def _batch(items: List[VectorRecord], size: int) -> List[List[VectorRecord]]:
+    return [items[i : i + size] for i in range(0, len(items), size)]
 
 
 class InMemoryVectorStore:
@@ -80,11 +90,22 @@ class InMemoryVectorStore:
             for vec_id in ids:
                 self._records.pop(vec_id, None)
 
+    async def count(self) -> int:
+        with self._lock:
+            return len(self._records)
+
 
 class PineconeVectorStore:
     """Pinecone-backed vector store using the serverless `medquery` index."""
 
-    def __init__(self, api_key: str, index_name: str, cloud: str, region: str, dimension: int) -> None:
+    def __init__(
+        self,
+        api_key: str,
+        index_name: str,
+        cloud: str,
+        region: str,
+        dimension: int,
+    ) -> None:
         from pinecone import Pinecone, ServerlessSpec
 
         self._pc = Pinecone(api_key=api_key)
@@ -99,12 +120,14 @@ class PineconeVectorStore:
         self._index = self._pc.Index(index_name)
 
     async def upsert(self, records: List[VectorRecord]) -> None:
-        import asyncio
-
-        payload = [
-            {"id": r.id, "values": r.values, "metadata": r.metadata} for r in records
-        ]
-        await asyncio.to_thread(self._index.upsert, vectors=payload)
+        if not records:
+            return
+        # Pinecone caps each upsert request at 100 vectors.
+        for batch in _batch(records, PINECONE_UPSERT_BATCH):
+            payload = [
+                {"id": r.id, "values": r.values, "metadata": r.metadata} for r in batch
+            ]
+            await asyncio.to_thread(self._index.upsert, vectors=payload)
 
     async def query(
         self,
@@ -112,8 +135,6 @@ class PineconeVectorStore:
         top_k: int = 5,
         document_ids: Optional[List[str]] = None,
     ) -> List[VectorMatch]:
-        import asyncio
-
         filter_: Dict[str, Any] | None = None
         if document_ids:
             filter_ = {"document_id": {"$in": list(document_ids)}}
@@ -131,11 +152,19 @@ class PineconeVectorStore:
         ]
 
     async def delete(self, ids: List[str]) -> None:
-        import asyncio
-
         if not ids:
             return
-        await asyncio.to_thread(self._index.delete, ids=ids)
+        # Pinecone delete by id also limits batch sizes; chunk to be safe.
+        for i in range(0, len(ids), PINECONE_UPSERT_BATCH):
+            batch = ids[i : i + PINECONE_UPSERT_BATCH]
+            await asyncio.to_thread(self._index.delete, ids=batch)
+
+    async def count(self) -> int:
+        try:
+            stats = await asyncio.to_thread(self._index.describe_index_stats)
+            return int(stats.get("total_vector_count", 0))
+        except Exception:
+            return 0
 
 
 _singleton_store: VectorStore | None = None

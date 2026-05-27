@@ -1,46 +1,51 @@
 services:
-  postgres:
+  postgresql:
     image: postgres:16-alpine
+    container_name: medquery-postgresql
     environment:
-      POSTGRES_USER: medquery
-      POSTGRES_PASSWORD: medquery
-      POSTGRES_DB: medquery
+      POSTGRES_USER: ${POSTGRES_USER:-medquery}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-medquery}
+      POSTGRES_DB: ${POSTGRES_DB:-medquery}
     ports:
       - "5432:5432"
     volumes:
       - pg_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U medquery"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-medquery}"]
       interval: 5s
       timeout: 5s
       retries: 10
 
-  backend:
+  fastapi-backend:
     build: ./backend
+    container_name: medquery-fastapi-backend
     environment:
-      DATABASE_URL: postgresql+asyncpg://medquery:medquery@postgres:5432/medquery
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-medquery}:${POSTGRES_PASSWORD:-medquery}@postgresql:5432/${POSTGRES_DB:-medquery}
       USE_FAKE_PROVIDERS: "${USE_FAKE_PROVIDERS:-true}"
       OPENAI_API_KEY: "${OPENAI_API_KEY:-}"
       OPENAI_EMBEDDING_MODEL: "${OPENAI_EMBEDDING_MODEL:-text-embedding-3-small}"
       OPENAI_CHAT_MODEL: "${OPENAI_CHAT_MODEL:-gpt-4o-mini}"
       PINECONE_API_KEY: "${PINECONE_API_KEY:-}"
       PINECONE_INDEX: "${PINECONE_INDEX:-medquery}"
+      PINECONE_CLOUD: "${PINECONE_CLOUD:-aws}"
+      PINECONE_REGION: "${PINECONE_REGION:-us-east-1}"
       CORS_ORIGINS: "http://localhost:3000"
       STORAGE_DIR: /data/storage
     depends_on:
-      postgres:
+      postgresql:
         condition: service_healthy
     ports:
       - "8000:8000"
     volumes:
       - backend_data:/data
 
-  frontend:
+  nextjs-frontend:
     build: ./frontend
+    container_name: medquery-nextjs-frontend
     environment:
-      NEXT_PUBLIC_API_URL: "http://localhost:8000"
+      NEXT_PUBLIC_API_URL: "${NEXT_PUBLIC_API_URL:-http://localhost:8000}"
     depends_on:
-      - backend
+      - fastapi-backend
     ports:
       - "3000:3000"
 
