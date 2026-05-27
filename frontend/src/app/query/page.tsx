@@ -5,12 +5,19 @@ import { clsx } from "clsx";
 import { ChatMessage, type ChatMessageData } from "@/components/ChatMessage";
 import {
   askQuestion,
+  createSession,
+  deleteSession,
+  getSession,
   listDocuments,
+  listSessions,
   type DocumentRead,
+  type SessionRead,
 } from "@/lib/api";
+import { formatDate } from "@/lib/format";
 
 export default function QueryPage() {
   const [documents, setDocuments] = useState<DocumentRead[]>([]);
+  const [sessions, setSessions] = useState<SessionRead[]>([]);
   const [selected, setSelected] = useState<string[]>([]);
   const [messages, setMessages] = useState<ChatMessageData[]>([]);
   const [question, setQuestion] = useState("");
@@ -24,6 +31,7 @@ export default function QueryPage() {
       setDocuments(docs);
       setSelected(docs.filter((d) => d.pinecone_ids.length > 0).map((d) => d.id));
     });
+    void listSessions().then(setSessions);
   }, []);
 
   useEffect(() => {
@@ -41,6 +49,49 @@ export default function QueryPage() {
     );
   }, []);
 
+  const refreshSessions = async () => {
+    setSessions(await listSessions());
+  };
+
+  const loadSession = async (id: string) => {
+    setError(null);
+    try {
+      const sess = await getSession(id);
+      setSessionId(sess.id);
+      setSelected(sess.document_ids);
+      setMessages(
+        sess.messages.flatMap((m) => [
+          { role: "user" as const, content: m.question },
+          {
+            role: "assistant" as const,
+            content: m.answer,
+            latency_ms: m.latency_ms,
+            confidence: m.confidence,
+          },
+        ]),
+      );
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to load session.");
+    }
+  };
+
+  const removeSession = async (id: string) => {
+    if (!confirm("Delete this session and all of its messages?")) return;
+    await deleteSession(id);
+    if (sessionId === id) {
+      setSessionId(undefined);
+      setMessages([]);
+    }
+    await refreshSessions();
+  };
+
+  const startSession = async () => {
+    const sess = await createSession(selected);
+    setSessionId(sess.id);
+    setMessages([]);
+    await refreshSessions();
+  };
+
   const submit = async (e: React.FormEvent) => {
     e.preventDefault();
     const q = question.trim();
@@ -57,6 +108,7 @@ export default function QueryPage() {
         session_id: sessionId,
         document_ids: selected.length ? selected : undefined,
       });
+      const sessionWasNew = !sessionId;
       setSessionId(response.session_id);
       setMessages((prev) => [
         ...prev,
@@ -66,9 +118,11 @@ export default function QueryPage() {
           citations: response.citations,
           latency_ms: response.latency_ms,
           confidence: response.confidence,
+          risk_flag: response.risk_flag,
           risk_flags: response.risk_flags,
         },
       ]);
+      if (sessionWasNew) await refreshSessions();
     } catch (err) {
       setError(err instanceof Error ? err.message : "Query failed.");
     } finally {
@@ -108,7 +162,7 @@ export default function QueryPage() {
               No indexed documents. Upload and embed first.
             </p>
           ) : (
-            <ul className="mt-3 max-h-[420px] space-y-1 overflow-auto pr-1">
+            <ul className="mt-3 max-h-[360px] space-y-1 overflow-auto pr-1">
               {indexedDocs.map((doc) => {
                 const checked = selected.includes(doc.id);
                 return (
@@ -147,19 +201,73 @@ export default function QueryPage() {
         </div>
 
         <div className="rounded-xl border border-clinical-border bg-clinical-panel p-4 text-xs text-clinical-subtle">
-          <p className="font-mono uppercase tracking-wider text-clinical-accent">
-            Session
-          </p>
-          <p className="mt-2 break-all font-mono text-[11px] text-slate-200">
-            {sessionId ?? "(not started)"}
-          </p>
-          <button
-            type="button"
-            onClick={resetSession}
-            className="mt-3 rounded-md border border-clinical-border bg-clinical-surface px-2 py-1 text-[11px] text-slate-200 hover:border-clinical-accent/40"
-          >
-            New session
-          </button>
+          <div className="flex items-center justify-between">
+            <p className="font-mono uppercase tracking-wider text-clinical-accent">
+              Sessions
+            </p>
+            <button
+              type="button"
+              onClick={startSession}
+              className="rounded-md border border-clinical-accent/40 bg-clinical-accent/10 px-2 py-0.5 text-[11px] text-clinical-accent hover:bg-clinical-accent/20"
+            >
+              + New
+            </button>
+          </div>
+
+          {sessionId && (
+            <div className="mt-3 rounded-md border border-clinical-accent/30 bg-clinical-accent/5 p-2">
+              <p className="break-all font-mono text-[10px] text-clinical-accent">
+                Active: {sessionId.slice(0, 8)}…
+              </p>
+              <button
+                type="button"
+                onClick={resetSession}
+                className="mt-1 text-[10px] text-slate-300 hover:text-clinical-accent"
+              >
+                Detach
+              </button>
+            </div>
+          )}
+
+          {sessions.length === 0 ? (
+            <p className="mt-3">No sessions yet. They&rsquo;re created on first query.</p>
+          ) : (
+            <ul className="mt-3 max-h-[200px] space-y-1 overflow-auto pr-1">
+              {sessions.map((s) => (
+                <li
+                  key={s.id}
+                  className={clsx(
+                    "rounded-md border p-2",
+                    s.id === sessionId
+                      ? "border-clinical-accent/40 bg-clinical-accent/10"
+                      : "border-clinical-border bg-clinical-surface",
+                  )}
+                >
+                  <div className="flex items-center justify-between gap-2">
+                    <button
+                      type="button"
+                      onClick={() => void loadSession(s.id)}
+                      className="min-w-0 flex-1 text-left text-[11px] text-slate-100 hover:text-clinical-accent"
+                    >
+                      <span className="block truncate font-mono">
+                        {s.id.slice(0, 8)}…
+                      </span>
+                      <span className="block text-[10px] text-clinical-subtle">
+                        {formatDate(s.created_at)}
+                      </span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => void removeSession(s.id)}
+                      className="text-[10px] text-clinical-subtle hover:text-clinical-risk"
+                    >
+                      Delete
+                    </button>
+                  </div>
+                </li>
+              ))}
+            </ul>
+          )}
         </div>
       </aside>
 
@@ -172,6 +280,7 @@ export default function QueryPage() {
             {selected.length > 0
               ? `Querying ${selected.length} document${selected.length === 1 ? "" : "s"}`
               : "Querying all indexed documents"}
+            {" · last 3 turns provided as conversation context"}
           </p>
         </div>
 
@@ -179,7 +288,8 @@ export default function QueryPage() {
           {messages.length === 0 && (
             <div className="rounded-lg border border-dashed border-clinical-border bg-clinical-surface p-6 text-center text-sm text-clinical-subtle">
               Ask any question about your indexed clinical documents. MedQuery
-              retrieves the top-5 most relevant chunks and answers with grounded
+              retrieves the top-5 most relevant chunks, passes recent
+              conversation history as context, and answers with grounded
               citations.
             </div>
           )}
@@ -192,9 +302,7 @@ export default function QueryPage() {
               Retrieving and reasoning…
             </div>
           )}
-          {error && (
-            <p className="text-xs text-clinical-risk">{error}</p>
-          )}
+          {error && <p className="text-xs text-clinical-risk">{error}</p>}
           <div ref={bottomRef} />
         </div>
 
