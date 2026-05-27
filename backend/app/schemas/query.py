@@ -32,6 +32,7 @@ class QueryResponse(BaseModel):
     citations: List[Citation]
     confidence: float
     latency_ms: int
+    risk_flag: bool = False
     risk_flags: List[str] = Field(default_factory=list)
     timestamp: datetime
 
