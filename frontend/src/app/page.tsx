@@ -2,12 +2,15 @@
 
 import Link from "next/link";
 import { useCallback, useEffect, useState } from "react";
+import { AnalyticsPanel } from "@/components/AnalyticsPanel";
 import { DocumentCard } from "@/components/DocumentCard";
 import {
   deleteDocument,
   embedDocument,
+  getAnalytics,
   listDocuments,
   listQueries,
+  type AnalyticsResponse,
   type DocumentRead,
   type QueryHistoryItem,
 } from "@/lib/api";
@@ -16,16 +19,23 @@ import { confidenceTone, formatDate } from "@/lib/format";
 export default function DashboardPage() {
   const [documents, setDocuments] = useState<DocumentRead[]>([]);
   const [queries, setQueries] = useState<QueryHistoryItem[]>([]);
+  const [analytics, setAnalytics] = useState<AnalyticsResponse | null>(null);
   const [embedding, setEmbedding] = useState<string | null>(null);
+  const [warning, setWarning] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
 
   const reload = useCallback(async () => {
     setError(null);
     try {
-      const [docs, qs] = await Promise.all([listDocuments(), listQueries(5)]);
+      const [docs, qs, an] = await Promise.all([
+        listDocuments(),
+        listQueries(5),
+        getAnalytics(),
+      ]);
       setDocuments(docs);
       setQueries(qs);
+      setAnalytics(an);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to load data.");
     } finally {
@@ -45,8 +55,10 @@ export default function DashboardPage() {
 
   const handleEmbed = async (id: string) => {
     setEmbedding(id);
+    setWarning(null);
     try {
-      await embedDocument(id);
+      const res = await embedDocument(id);
+      if (res.warning) setWarning(res.warning);
       await reload();
     } catch (err) {
       setError(err instanceof Error ? err.message : "Embedding failed.");
@@ -98,11 +110,18 @@ export default function DashboardPage() {
         </div>
       </section>
 
+      {warning && (
+        <div className="rounded-lg border border-clinical-warn/50 bg-clinical-warn/10 p-3 text-xs text-clinical-warn">
+          {warning}
+        </div>
+      )}
       {error && (
         <div className="rounded-lg border border-clinical-risk/50 bg-clinical-risk/10 p-4 text-sm text-clinical-risk">
           {error}
         </div>
       )}
+
+      {analytics && <AnalyticsPanel data={analytics} />}
 
       <section>
         <div className="mb-3 flex items-center justify-between">

@@ -11,6 +11,12 @@ from PyPDF2 import PdfReader
 
 from app.core.config import get_settings
 
+MIN_EXTRACTED_CHARS = 100
+
+
+class ScannedPdfError(ValueError):
+    """Raised when a PDF appears to be a scanned image with no extractable text."""
+
 
 @dataclass
 class Chunk:
@@ -20,7 +26,6 @@ class Chunk:
 
 
 def _approx_token_to_char(tokens: int) -> int:
-    # OpenAI tokens roughly correspond to ~4 chars on average for English text.
     return tokens * 4
 
 
@@ -40,15 +45,29 @@ def _extract_text(data: bytes) -> List[tuple[int, str]]:
 
 
 async def extract_text(filename: str, data: bytes) -> List[tuple[int, str]]:
-    """Return [(page_number, page_text), ...] for a PDF or plain-text upload."""
+    """Return [(page_number, page_text), ...] for a PDF or plain-text upload.
+
+    Raises ScannedPdfError if the document is a PDF and the total extracted
+    text is shorter than MIN_EXTRACTED_CHARS — almost always the signature
+    of an image-only scan that needs OCR.
+    """
     lower = filename.lower()
+    is_pdf = lower.endswith(".pdf")
 
     def _run() -> List[tuple[int, str]]:
-        if lower.endswith(".pdf"):
+        if is_pdf:
             return _extract_pdf(data)
         return _extract_text(data)
 
-    return await asyncio.to_thread(_run)
+    pages = await asyncio.to_thread(_run)
+
+    if is_pdf:
+        total = sum(len(text) for _, text in pages)
+        if total < MIN_EXTRACTED_CHARS:
+            raise ScannedPdfError(
+                "Scanned PDF detected, text extraction not supported"
+            )
+    return pages
 
 
 def split_chunks(pages: List[tuple[int, str]]) -> List[Chunk]:

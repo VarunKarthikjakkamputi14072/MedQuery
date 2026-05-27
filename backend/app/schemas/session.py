@@ -2,9 +2,11 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import List, Optional
+from typing import List
 
 from pydantic import BaseModel, ConfigDict, Field
+
+from app.schemas.query import QueryHistoryItem
 
 
 class SessionCreate(BaseModel):
@@ -17,3 +19,7 @@ class SessionRead(BaseModel):
     id: str
     created_at: datetime
     document_ids: List[str]
+
+
+class SessionWithMessages(SessionRead):
+    messages: List[QueryHistoryItem] = Field(default_factory=list)

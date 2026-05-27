@@ -5,12 +5,21 @@ from dataclasses import dataclass
 from typing import List, Protocol
 
 from app.core.config import get_settings
+from app.services.retry import retry_async
 
 
 @dataclass
 class ContextSnippet:
     label: str
     text: str
+
+
+@dataclass
+class TurnHistory:
+    """A previous question/answer pair surfaced as conversation context."""
+
+    question: str
+    answer: str
 
 
 class ChatProvider(Protocol):
@@ -22,36 +31,50 @@ SYSTEM_PROMPT = (
     "Answer strictly using the provided document context. "
     "When you reference information, cite the chunk by its label like [Doc 1, chunk 2]. "
     "If the context does not contain the answer, say so explicitly and do not invent facts. "
+    "Treat the conversation history as background only — every new answer must still "
+    "be grounded in the provided context. "
     "Never provide medical advice; summarise what the documents say."
 )
 
 
-def build_user_prompt(question: str, snippets: List[ContextSnippet]) -> str:
-    if not snippets:
-        return (
-            f"Question: {question}\n\n"
-            "Context: (no documents matched)\n\n"
-            "Reply that no relevant context was found."
-        )
+def build_user_prompt(
+    question: str,
+    snippets: List[ContextSnippet],
+    history: List[TurnHistory] | None = None,
+) -> str:
+    sections: List[str] = []
 
-    context_block = "\n\n".join(f"[{s.label}]\n{s.text}" for s in snippets)
-    return (
-        f"Question: {question}\n\n"
-        f"Context:\n{context_block}\n\n"
-        "Provide a concise, evidence-grounded answer. Cite chunk labels in brackets."
-    )
+    if history:
+        history_block = "\n\n".join(
+            f"Q{i + 1}: {h.question}\nA{i + 1}: {h.answer}"
+            for i, h in enumerate(history)
+        )
+        sections.append(f"Conversation so far:\n{history_block}")
+
+    sections.append(f"Question: {question}")
+
+    if snippets:
+        context_block = "\n\n".join(f"[{s.label}]\n{s.text}" for s in snippets)
+        sections.append(f"Context:\n{context_block}")
+        sections.append(
+            "Provide a concise, evidence-grounded answer. Cite chunk labels in brackets."
+        )
+    else:
+        sections.append("Context: (no documents matched)")
+        sections.append("Reply that no relevant context was found.")
+
+    return "\n\n".join(sections)
 
 
 class FakeChatProvider:
     """Deterministic, citation-aware fake answer used when no API key is set."""
 
     async def complete(self, system_prompt: str, user_prompt: str) -> str:
-        # Pull the question + first context snippet so the answer is grounded.
         question = ""
         first_snippet = ""
         first_label = ""
         for line in user_prompt.splitlines():
-            if line.startswith("Question:"):
+            if line.startswith("Question:") and not question:
                 question = line[len("Question:") :].strip()
             if line.startswith("[") and "]" in line and not first_label:
                 first_label = line.strip("[]")
@@ -60,7 +83,6 @@ class FakeChatProvider:
             chunks = [c for c in context_section.split("\n\n") if c.strip()]
             if chunks:
                 body = chunks[0]
-                # Drop the [label] header line for the preview.
                 first_snippet = body.split("\n", 1)[1] if "\n" in body else body
                 first_snippet = first_snippet.strip()[:400]
 
@@ -86,15 +108,18 @@ class OpenAIChatProvider:
         self._model = model
 
     async def complete(self, system_prompt: str, user_prompt: str) -> str:
-        response = await self._client.chat.completions.create(
-            model=self._model,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-            temperature=0.1,
-        )
-        return response.choices[0].message.content or ""
+        async def _call() -> str:
+            response = await self._client.chat.completions.create(
+                model=self._model,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                temperature=0.1,
+            )
+            return response.choices[0].message.content or ""
+
+        return await retry_async(_call, label="openai.chat")
 
 
 def get_chat_provider() -> ChatProvider:

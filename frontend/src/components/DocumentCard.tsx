@@ -1,5 +1,6 @@
 "use client";
 
+import Link from "next/link";
 import { clsx } from "clsx";
 import type { DocumentRead } from "@/lib/api";
 import { formatBytes, formatDate } from "@/lib/format";
@@ -28,9 +29,13 @@ export function DocumentCard({ document, onDelete, onEmbed, embedding }: Props) 
     <div className="group rounded-lg border border-clinical-border bg-clinical-panel p-4 transition hover:border-clinical-accent/50 hover:shadow-glow">
       <div className="flex items-start justify-between gap-3">
         <div className="min-w-0">
-          <p className="truncate font-mono text-sm text-slate-100" title={document.filename}>
+          <Link
+            href={`/documents/${document.id}`}
+            className="block truncate font-mono text-sm text-slate-100 hover:text-clinical-accent"
+            title={document.filename}
+          >
             {document.filename}
-          </p>
+          </Link>
           <p className="mt-1 text-xs text-clinical-subtle">
             {formatDate(document.upload_timestamp)} · {formatBytes(document.size_bytes)}
           </p>
@@ -62,6 +67,12 @@ export function DocumentCard({ document, onDelete, onEmbed, embedding }: Props) 
           </span>
         </div>
         <div className="flex items-center gap-2">
+          <Link
+            href={`/documents/${document.id}`}
+            className="rounded-md border border-clinical-border px-2 py-1 text-slate-300 transition hover:border-clinical-accent/50 hover:text-clinical-accent"
+          >
+            Details
+          </Link>
           {!indexed && onEmbed && (
             <button
               type="button"

@@ -36,6 +36,7 @@ export interface QueryResponse {
   citations: Citation[];
   confidence: number;
   latency_ms: number;
+  risk_flag: boolean;
   risk_flags: string[];
   timestamp: string;
 }
@@ -48,6 +49,57 @@ export interface QueryHistoryItem {
   latency_ms: number;
   confidence: number;
   timestamp: string;
+}
+
+export interface EntityRead {
+  id: string;
+  document_id: string;
+  entity_type: "medication" | "diagnosis" | "procedure" | "lab_value";
+  entity_text: string;
+  confidence: number;
+  created_at: string;
+}
+
+export interface ExtractResponse {
+  document_id: string;
+  entities: EntityRead[];
+  summary: Record<string, number>;
+}
+
+export interface EmbedResponse {
+  document_id: string;
+  chunk_count: number;
+  pinecone_ids: string[];
+  warning?: string | null;
+}
+
+export interface SessionRead {
+  id: string;
+  created_at: string;
+  document_ids: string[];
+}
+
+export interface SessionWithMessages extends SessionRead {
+  messages: QueryHistoryItem[];
+}
+
+export interface DocumentUsage {
+  document_id: string;
+  document_name: string;
+  query_count: number;
+}
+
+export interface TopQuestion {
+  question: string;
+  count: number;
+}
+
+export interface AnalyticsResponse {
+  total_queries: number;
+  avg_latency_ms: number;
+  avg_confidence: number;
+  queries_per_document: DocumentUsage[];
+  top_questions: TopQuestion[];
 }
 
 async function handle<T>(res: Response): Promise<T> {
@@ -68,6 +120,11 @@ async function handle<T>(res: Response): Promise<T> {
 export async function listDocuments(): Promise<DocumentRead[]> {
   const res = await fetch(`${API_URL}/documents`, { cache: "no-store" });
   return handle<DocumentRead[]>(res);
+}
+
+export async function getDocument(id: string): Promise<DocumentRead> {
+  const res = await fetch(`${API_URL}/documents/${id}`, { cache: "no-store" });
+  return handle<DocumentRead>(res);
 }
 
 export async function uploadDocument(
@@ -107,13 +164,33 @@ export async function uploadDocument(
   });
 }
 
-export async function embedDocument(documentId: string): Promise<void> {
+export async function embedDocument(documentId: string): Promise<EmbedResponse> {
   const res = await fetch(`${API_URL}/embed`, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ document_id: documentId }),
   });
-  await handle(res);
+  return handle<EmbedResponse>(res);
+}
+
+export async function extractDocument(
+  documentId: string,
+): Promise<ExtractResponse> {
+  const res = await fetch(`${API_URL}/extract`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ document_id: documentId }),
+  });
+  return handle<ExtractResponse>(res);
+}
+
+export async function listDocumentEntities(
+  documentId: string,
+): Promise<EntityRead[]> {
+  const res = await fetch(`${API_URL}/documents/${documentId}/entities`, {
+    cache: "no-store",
+  });
+  return handle<EntityRead[]>(res);
 }
 
 export async function deleteDocument(documentId: string): Promise<void> {
@@ -141,4 +218,33 @@ export async function listQueries(limit = 10): Promise<QueryHistoryItem[]> {
     cache: "no-store",
   });
   return handle<QueryHistoryItem[]>(res);
+}
+
+export async function listSessions(): Promise<SessionRead[]> {
+  const res = await fetch(`${API_URL}/sessions`, { cache: "no-store" });
+  return handle<SessionRead[]>(res);
+}
+
+export async function createSession(documentIds: string[]): Promise<SessionRead> {
+  const res = await fetch(`${API_URL}/sessions`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ document_ids: documentIds }),
+  });
+  return handle<SessionRead>(res);
+}
+
+export async function getSession(id: string): Promise<SessionWithMessages> {
+  const res = await fetch(`${API_URL}/sessions/${id}`, { cache: "no-store" });
+  return handle<SessionWithMessages>(res);
+}
+
+export async function deleteSession(id: string): Promise<void> {
+  const res = await fetch(`${API_URL}/sessions/${id}`, { method: "DELETE" });
+  await handle(res);
+}
+
+export async function getAnalytics(): Promise<AnalyticsResponse> {
+  const res = await fetch(`${API_URL}/analytics`, { cache: "no-store" });
+  return handle<AnalyticsResponse>(res);
 }
