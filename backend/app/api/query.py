@@ -15,6 +15,7 @@ from app.models.session import Session as ChatSession
 from app.schemas.query import Citation, QueryHistoryItem, QueryRequest, QueryResponse
 from app.services.dedup import dedupe_matches
 from app.services.embeddings import EmbeddingProvider
+from app.services.hybrid_search import DEFAULT_ALPHA, build_sparse_vector
 from app.services.llm import (
     SYSTEM_PROMPT,
     ChatProvider,
@@ -79,11 +80,14 @@ async def query(
 
     started = time.perf_counter()
     [query_vector] = await embedder.embed([payload.question])
+    sparse_query = build_sparse_vector(payload.question)
     raw_matches = await vector_store.query(
         query_vector,
         # Retrieve a few extras so dedupe leaves us with enough context.
         top_k=max(top_k * 2, top_k + 2),
         document_ids=document_ids,
+        sparse_vector=sparse_query,
+        alpha=DEFAULT_ALPHA,
     )
     matches = dedupe_matches(raw_matches)[:top_k]
 

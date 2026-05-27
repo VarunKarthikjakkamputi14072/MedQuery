@@ -2,9 +2,9 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import List, Optional
+from typing import Dict, List, Optional
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 DOCUMENT_TYPES = [
     "Discharge Summary",
@@ -23,13 +23,16 @@ class DocumentRead(BaseModel):
     upload_timestamp: datetime
     chunk_count: int
     pinecone_ids: List[str]
+    redaction_counts: Dict[str, int] = Field(default_factory=dict)
     size_bytes: int
     status: str
+    processing_error: Optional[str] = None
 
 
 class UploadResponse(BaseModel):
     document: DocumentRead
     preview: str
+    task_id: Optional[str] = None
 
 
 class EmbedRequest(BaseModel):
@@ -41,3 +44,5 @@ class EmbedResponse(BaseModel):
     chunk_count: int
     pinecone_ids: List[str]
     warning: Optional[str] = None
+    status: str = "indexed"
+    error: Optional[str] = None

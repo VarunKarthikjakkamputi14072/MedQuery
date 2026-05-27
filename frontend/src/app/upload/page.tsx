@@ -3,7 +3,7 @@
 import { useRouter } from "next/navigation";
 import { useState } from "react";
 import { UploadZone } from "@/components/UploadZone";
-import { embedDocument, extractDocument, uploadDocument } from "@/lib/api";
+import { uploadDocument } from "@/lib/api";
 
 export default function UploadPage() {
   const router = useRouter();
@@ -17,10 +17,9 @@ export default function UploadPage() {
         </p>
         <h1 className="mt-1 text-2xl font-semibold">Upload a clinical document</h1>
         <p className="mt-2 max-w-2xl text-sm text-clinical-subtle">
-          We&rsquo;ll extract text with PyPDF2, chunk it into 512-token segments
-          (with 50-token overlap) via LangChain, embed each chunk with OpenAI,
-          index the vectors in Pinecone, and pull out medical entities — all
-          triggered automatically after upload.
+          We&rsquo;ll store the file, queue a background worker, redact PHI before
+          embeddings, build dense + sparse hybrid retrieval features, and pull
+          out medical entities automatically.
         </p>
       </div>
 
@@ -33,22 +32,13 @@ export default function UploadPage() {
       <div className="rounded-xl border border-clinical-border bg-clinical-panel p-6 shadow-glow">
         <UploadZone
           onUpload={async (file, documentType, onProgress) => {
-            const { document } = await uploadDocument(
+            const { document, preview } = await uploadDocument(
               file,
               documentType,
               onProgress,
             );
+            setWarning(preview);
             return { documentId: document.id };
-          }}
-          onIndex={async (documentId) => {
-            const res = await embedDocument(documentId);
-            if (res.warning) setWarning(res.warning);
-            // Best-effort entity extraction; failures shouldn't block the upload.
-            try {
-              await extractDocument(documentId);
-            } catch (err) {
-              console.warn("entity extraction failed", err);
-            }
           }}
         />
       </div>

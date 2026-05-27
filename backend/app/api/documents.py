@@ -1,12 +1,12 @@
 """Document upload, embedding, extraction, listing, and deletion endpoints."""
 from __future__ import annotations
 
-import logging
 from pathlib import Path
 from typing import List
 
 from fastapi import (
     APIRouter,
+    BackgroundTasks,
     Depends,
     File,
     Form,
@@ -20,7 +20,6 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import (
-    embedding_dep,
     session_dep,
     storage_dep,
     vector_dep,
@@ -36,17 +35,14 @@ from app.schemas.document import (
     UploadResponse,
 )
 from app.schemas.entity import EntityRead, ExtractResponse
-from app.services.embeddings import EmbeddingProvider
 from app.services.entity_extraction import extract_entities, summarize_entities
+from app.services.ingestion import process_document_ingestion
 from app.services.storage import LocalStorage
-from app.services.text_extraction import ScannedPdfError, extract_text, split_chunks
+from app.services.tasks import enqueue_document_ingestion
+from app.services.text_extraction import ScannedPdfError, extract_text
 from app.services.vector_store import (
-    PINECONE_FREE_TIER_LIMIT,
-    VectorRecord,
     VectorStore,
 )
-
-logger = logging.getLogger(__name__)
 
 documents_router = APIRouter(prefix="/documents", tags=["documents"])
 upload_router = APIRouter(tags=["documents"])
@@ -54,7 +50,6 @@ embed_router = APIRouter(tags=["documents"])
 extract_router = APIRouter(tags=["documents"])
 
 ALLOWED_EXTENSIONS = {".pdf", ".txt"}
-PINECONE_WARN_RATIO = 0.9
 
 
 def _validate_upload(file: UploadFile, size: int) -> None:
@@ -144,8 +139,13 @@ async def delete_document(
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
-@upload_router.post("/upload", response_model=UploadResponse)
+@upload_router.post(
+    "/upload",
+    response_model=UploadResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+)
 async def upload_document(
+    background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     document_type: str = Form("Clinical Note"),
     session: AsyncSession = Depends(session_dep),
@@ -155,115 +155,50 @@ async def upload_document(
     data = await file.read()
     _validate_upload(file, len(data))
 
-    try:
-        pages = await extract_text(file.filename or "upload.bin", data)
-    except ScannedPdfError as exc:
-        raise HTTPException(status_code=422, detail=str(exc))
-
-    chunks = split_chunks(pages)
-    preview = "\n\n".join(c.text for c in chunks[:1])[:600]
-
     storage_path, size_bytes = await storage.save(file.filename or "upload.bin", data)
 
     document = Document(
         filename=file.filename or "upload.bin",
         document_type=document_type,
-        chunk_count=len(chunks),
+        chunk_count=0,
         pinecone_ids=[],
+        redaction_counts={},
         storage_path=storage_path,
         size_bytes=size_bytes,
-        status="extracted",
+        status="queued",
     )
     session.add(document)
     await session.commit()
     await session.refresh(document)
 
-    return UploadResponse(document=DocumentRead.model_validate(document), preview=preview)
+    task_id = enqueue_document_ingestion(document.id, background_tasks)
+
+    return UploadResponse(
+        document=DocumentRead.model_validate(document),
+        preview="Document queued for redaction, embedding, and entity extraction.",
+        task_id=task_id,
+    )
 
 
 @embed_router.post("/embed", response_model=EmbedResponse)
 async def embed_document(
     payload: EmbedRequest,
     session: AsyncSession = Depends(session_dep),
-    vector_store: VectorStore = Depends(vector_dep),
-    embedder: EmbeddingProvider = Depends(embedding_dep),
 ) -> EmbedResponse:
     document = await session.get(Document, payload.document_id)
     if not document:
         raise HTTPException(status_code=404, detail="Document not found")
 
-    path = Path(document.storage_path)
-    if not path.exists():
-        raise HTTPException(status_code=410, detail="Stored file no longer exists")
-
-    data = path.read_bytes()
-    try:
-        pages = await extract_text(document.filename, data)
-    except ScannedPdfError as exc:
-        raise HTTPException(status_code=422, detail=str(exc))
-
-    chunks = split_chunks(pages)
-    if not chunks:
-        raise HTTPException(status_code=422, detail="No text extracted from document")
-
-    # Pinecone free-tier cap warning. Soft-block when adding these vectors
-    # would push us over the 100k vector ceiling.
-    try:
-        current_count = await vector_store.count()
-    except Exception:  # pragma: no cover - defensive
-        current_count = 0
-    warning: str | None = None
-    projected = current_count + len(chunks)
-    if projected > PINECONE_FREE_TIER_LIMIT:
-        raise HTTPException(
-            status_code=507,
-            detail=(
-                f"Embedding this document would push the Pinecone index to "
-                f"{projected} vectors, over the free-tier limit of "
-                f"{PINECONE_FREE_TIER_LIMIT}."
-            ),
-        )
-    if projected > PINECONE_FREE_TIER_LIMIT * PINECONE_WARN_RATIO:
-        warning = (
-            f"Approaching Pinecone free-tier limit: {projected}/"
-            f"{PINECONE_FREE_TIER_LIMIT} vectors after this upsert."
-        )
-        logger.warning(warning)
-
-    vectors = await embedder.embed([c.text for c in chunks])
-    records: list[VectorRecord] = []
-    pinecone_ids: list[str] = []
-    for chunk, vector in zip(chunks, vectors):
-        vec_id = f"{document.id}:{chunk.index}"
-        pinecone_ids.append(vec_id)
-        records.append(
-            VectorRecord(
-                id=vec_id,
-                values=vector,
-                metadata={
-                    "document_id": document.id,
-                    "document_name": document.filename,
-                    "document_type": document.document_type,
-                    "chunk_index": chunk.index,
-                    "page": chunk.page or 1,
-                    "text": chunk.text,
-                },
-            )
-        )
-
-    await vector_store.upsert(records)
-
-    document.pinecone_ids = pinecone_ids
-    document.chunk_count = len(chunks)
-    document.status = "indexed"
-    await session.commit()
-    await session.refresh(document)
-
+    result = await process_document_ingestion(document.id)
+    if result.status == "failed":
+        raise HTTPException(status_code=422, detail=result.error or "Embedding failed")
     return EmbedResponse(
-        document_id=document.id,
-        chunk_count=document.chunk_count,
-        pinecone_ids=pinecone_ids,
-        warning=warning,
+        document_id=result.document_id,
+        chunk_count=result.chunk_count,
+        pinecone_ids=result.pinecone_ids,
+        warning=result.warning,
+        status=result.status,
+        error=result.error,
     )
 
 

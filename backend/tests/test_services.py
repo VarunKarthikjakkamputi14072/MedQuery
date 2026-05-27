@@ -5,10 +5,12 @@ import pytest
 
 from app.services.dedup import dedupe_matches
 from app.services.entity_extraction import extract_entities
+from app.services.hybrid_search import build_sparse_vector
+from app.services.redaction import RegexPhiRedactor
 from app.services.retry import retry_async
 from app.services.risk_flags import detect_risk_flags
 from app.services.text_extraction import split_chunks
-from app.services.vector_store import VectorMatch
+from app.services.vector_store import InMemoryVectorStore, VectorMatch, VectorRecord
 
 
 def test_chunking_returns_overlapping_pieces():
@@ -100,3 +102,49 @@ def test_entity_extraction_regex_backend():
     assert "lab_value" in types
     assert "pneumonia" in texts
     assert any("wbc" in t for t in texts)
+
+
+def test_phi_redactor_masks_identifiers():
+    redactor = RegexPhiRedactor()
+    result = redactor.redact(
+        "Patient John Doe DOB 01/02/1970 MRN: AB-1234 SSN 123-45-6789 "
+        "email john@example.com"
+    )
+
+    assert "John Doe" not in result.text
+    assert "01/02/1970" not in result.text
+    assert "123-45-6789" not in result.text
+    assert "john@example.com" not in result.text
+    assert "[REDACTED_PERSON]" in result.text
+    assert result.counts["PERSON"] == 1
+
+
+@pytest.mark.asyncio
+async def test_sparse_hybrid_search_boosts_exact_clinical_terms():
+    store = InMemoryVectorStore()
+    await store.upsert(
+        [
+            VectorRecord(
+                id="lab",
+                values=[1.0, 0.0],
+                metadata={"text": "HbA1c 9.1 percent and LDL 142 mg/dL"},
+                sparse_values=build_sparse_vector("HbA1c 9.1 percent and LDL 142 mg/dL"),
+            ),
+            VectorRecord(
+                id="note",
+                values=[1.0, 0.0],
+                metadata={"text": "General discharge planning and diet counseling"},
+                sparse_values=build_sparse_vector("General discharge planning and diet counseling"),
+            ),
+        ]
+    )
+
+    matches = await store.query(
+        [1.0, 0.0],
+        top_k=2,
+        sparse_vector=build_sparse_vector("HbA1c"),
+        alpha=0.5,
+    )
+
+    assert matches[0].id == "lab"
+    assert matches[0].sparse_score > 0

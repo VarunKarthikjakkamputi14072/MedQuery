@@ -49,6 +49,7 @@ def create_app() -> FastAPI:
             "status": "ok",
             "service": "medquery",
             "fake_providers": settings.use_fake_providers,
+            "ingest_queue_backend": settings.ingest_queue_backend,
         }
 
     @app.get("/", tags=["meta"])

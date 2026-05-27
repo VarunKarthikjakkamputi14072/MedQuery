@@ -14,8 +14,10 @@ export interface DocumentRead {
   upload_timestamp: string;
   chunk_count: number;
   pinecone_ids: string[];
+  redaction_counts: Record<string, number>;
   size_bytes: number;
   status: string;
+  processing_error?: string | null;
 }
 
 export interface Citation {
@@ -71,6 +73,8 @@ export interface EmbedResponse {
   chunk_count: number;
   pinecone_ids: string[];
   warning?: string | null;
+  status: string;
+  error?: string | null;
 }
 
 export interface SessionRead {
@@ -131,7 +135,7 @@ export async function uploadDocument(
   file: File,
   documentType: DocumentType,
   onProgress?: (pct: number) => void,
-): Promise<{ document: DocumentRead; preview: string }> {
+): Promise<{ document: DocumentRead; preview: string; task_id?: string | null }> {
   return new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest();
     const form = new FormData();

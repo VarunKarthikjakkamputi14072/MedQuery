@@ -17,10 +17,12 @@ FastAPI backend (async)
         │
         ├──► Local filesystem (mock S3) for uploaded PDFs/TXT
         ├──► PostgreSQL (documents, sessions, queries, entities)
+        ├──► Redis + Celery worker for asynchronous ingest jobs
         ├──► LangChain RecursiveCharacterTextSplitter (512 / 50 tokens)
+        ├──► PHI/PII redaction before embeddings/vector metadata
         ├──► spaCy / scispaCy en_core_sci_sm (+ regex fallback)  → entities
         ├──► OpenAI text-embedding-3-small (embeddings, with retries)
-        ├──► Pinecone serverless index "medquery" (batched upserts ≤100)
+        ├──► Pinecone serverless index "medquery" (dense + sparse hybrid search)
         └──► OpenAI gpt-4o-mini (multi-turn, with retries)
 ```
 
@@ -46,10 +48,10 @@ docker-compose.yml   postgresql + fastapi-backend + nextjs-frontend
 
 | Method | Path                            | Description                                                                                          |
 | ------ | ------------------------------- | ---------------------------------------------------------------------------------------------------- |
-| POST   | `/upload`                       | Accepts PDF/TXT (max 10 MB), stores in mock-S3 dir, extracts text + chunks via LangChain (512/50)    |
-| POST   | `/embed`                        | Embeds chunks via `text-embedding-3-small`, batched Pinecone upserts (≤100), free-tier cap warning   |
+| POST   | `/upload`                       | Accepts PDF/TXT (max 10 MB), stores in mock-S3 dir, returns `202`, and queues ingest                 |
+| POST   | `/embed`                        | Re-runs ingest synchronously for retries: extraction, PHI redaction, embeddings, hybrid vectors      |
 | POST   | `/extract`                      | spaCy `en_core_sci_sm` (or regex fallback) → medications, diagnoses, procedures, lab values          |
-| POST   | `/query`                        | Top-5 chunks (deduped by content hash), last 3 turns as context, returns answer + citations + risk   |
+| POST   | `/query`                        | Top-5 hybrid chunks (deduped), last 3 turns as context, returns answer + citations + risk            |
 | GET    | `/documents`                    | List uploaded documents with metadata                                                                |
 | GET    | `/documents/{id}`               | Document metadata                                                                                    |
 | GET    | `/documents/{id}/entities`      | All extracted entities for a document                                                                |
@@ -66,7 +68,7 @@ All endpoints are `async`. CORS allows `http://localhost:3000` by default.
 
 ### Database schema (PostgreSQL via SQLAlchemy 2.0 async)
 
-- `documents` — id, filename, document_type, upload_timestamp, chunk_count, pinecone_ids, storage_path, size_bytes, status
+- `documents` — id, filename, document_type, upload_timestamp, chunk_count, pinecone_ids, redaction_counts, storage_path, size_bytes, status, processing_error
 - `sessions` — id, created_at, document_ids
 - `queries` — id, session_id, question, answer, retrieved_chunks, latency_ms, confidence, timestamp
 - `entities` — id, document_id (FK), entity_type, entity_text, confidence, created_at
@@ -80,8 +82,9 @@ Models work against both Postgres (production) and SQLite (tests).
    the upsert would exceed the limit. The warning surfaces in the
    dashboard + upload UI.
 2. **Scanned-PDF detection** — `extract_text` raises
-   `ScannedPdfError` (→ HTTP 422) if the combined extracted text from a
-   PDF is shorter than 100 characters.
+   `ScannedPdfError` if the combined extracted text from a PDF is shorter
+   than 100 characters. Because upload ingestion is asynchronous, the
+   document status becomes `failed` with `processing_error` populated.
 3. **OpenAI rate limits** — every embedding and chat call is wrapped in
    an async exponential-backoff retry (3 attempts: 2 s / 4 s / 8 s).
 4. **Duplicate retrieved context** — `dedupe_matches` SHA-256 hashes the
@@ -91,11 +94,29 @@ Models work against both Postgres (production) and SQLite (tests).
    100-vector batches both for upsert and delete operations.
 6. **CORS** — FastAPI `CORSMiddleware` configured for
    `http://localhost:3000` (configurable via `CORS_ORIGINS`).
+7. **PHI/PII redaction before OpenAI/Pinecone** — chunks pass through a
+   redaction layer before embedding and before text is stored as vector
+   metadata. The default deterministic regex redactor masks names, dates,
+   SSNs, emails, phone numbers, and MRNs; `REDACTION_PROVIDER=presidio`
+   enables the Microsoft Presidio-backed implementation when the NLP model
+   is provisioned.
+8. **Asynchronous ingestion** — `/upload` stores the original file and
+   immediately returns `202 Accepted`; extraction, redaction, chunking,
+   embedding, Pinecone upsert, and entity extraction run in a worker. Local
+   dev defaults to FastAPI background tasks, while Docker uses Redis +
+   Celery (`INGEST_QUEUE_BACKEND=celery`).
+9. **Hybrid retrieval** — each chunk gets dense OpenAI embeddings plus
+   hashed BM25-style sparse features. Queries send both dense and sparse
+   vectors so exact clinical acronyms, medication strings, and lab IDs can
+   boost retrieval alongside semantic matches. New Pinecone indexes default
+   to `PINECONE_METRIC=dotproduct`, which supports hybrid dense+sparse
+   scoring; existing cosine indexes fall back to dense queries if sparse
+   payloads are rejected.
 
 ### Stack
 
-FastAPI · SQLAlchemy 2.0 (async) · PostgreSQL · asyncpg · LangChain ·
-Pinecone · PyPDF2 · OpenAI · spaCy / scispaCy (optional) ·
+FastAPI · SQLAlchemy 2.0 (async) · PostgreSQL · Redis · Celery · asyncpg · LangChain ·
+Pinecone · PyPDF2 · OpenAI · Microsoft Presidio (optional) · spaCy / scispaCy (optional) ·
 pydantic-settings · python-dotenv · pytest-asyncio.
 
 ### Running locally
@@ -109,7 +130,10 @@ uvicorn app.main:app --reload
 ```
 
 To use the real providers, set `USE_FAKE_PROVIDERS=false` and provide
-`OPENAI_API_KEY` plus `PINECONE_API_KEY` in `.env`. To enable real
+`OPENAI_API_KEY` plus `PINECONE_API_KEY` in `.env`. Local uploads use
+post-response background tasks by default; set `INGEST_QUEUE_BACKEND=celery`
+and run `celery -A app.worker.celery_app worker --loglevel=info` with Redis
+for production-like queueing. To enable real
 scispaCy entity extraction:
 
 ```bash
@@ -124,10 +148,11 @@ cd backend
 pytest
 ```
 
-18 tests in `backend/tests/` cover upload → embed → extract → query →
-delete, scanned-PDF rejection, multi-turn sessions, session delete
+20 tests in `backend/tests/` cover upload → embed → extract → query →
+delete, scanned-PDF failure status, multi-turn sessions, session delete
 cascading, analytics aggregation, deterministic embeddings, retry
-helper, risk-flag detection, dedupe, and entity extraction.
+helper, risk-flag detection, dedupe, PHI redaction, sparse hybrid search,
+and entity extraction.
 
 ## Frontend
 
@@ -140,7 +165,8 @@ Pages:
   (totals, avg latency, avg confidence, per-document usage, top-5
   questions), recent queries.
 - `/upload` — Drag-and-drop ingest, document type selector, live
-  progress and embedding indicator (auto-triggers entity extraction).
+  progress and queued-worker indicator (worker auto-triggers redaction,
+  indexing, and entity extraction).
 - `/documents/[id]` — Document detail with stats and the **entity
   summary panel** (medications, diagnoses, procedures, lab values).
 - `/query` — Multi-select document filter, chat history with collapsible
@@ -172,6 +198,8 @@ required ports:
 | `nextjs-frontend`  | 3000 |
 | `fastapi-backend`  | 8000 |
 | `postgresql`       | 5432 |
+| `redis`            | 6379 |
+| `celery-worker`    | n/a  |
 
 ```bash
 cp .env.example .env

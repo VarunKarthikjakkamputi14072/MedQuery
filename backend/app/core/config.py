@@ -29,8 +29,15 @@ class Settings(BaseSettings):
     pinecone_index: str = "medquery"
     pinecone_cloud: str = "aws"
     pinecone_region: str = "us-east-1"
+    pinecone_metric: str = "dotproduct"
 
     storage_dir: str = "./storage"
+    redis_url: str = "redis://localhost:6379/0"
+    celery_broker_url: str = ""
+    celery_result_backend: str = ""
+    ingest_queue_backend: str = "background"
+    celery_task_always_eager: bool = False
+    redaction_provider: str = "regex"
 
     cors_origins: List[str] = Field(default_factory=lambda: ["http://localhost:3000"])
 

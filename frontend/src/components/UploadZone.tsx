@@ -15,7 +15,7 @@ const MAX_BYTES = 10 * 1024 * 1024;
 const ALLOWED = [".pdf", ".txt"];
 
 interface UploadStatus {
-  state: "idle" | "uploading" | "embedding" | "done" | "error";
+  state: "idle" | "uploading" | "queued" | "done" | "error";
   progress: number;
   message?: string;
   filename?: string;
@@ -27,10 +27,9 @@ interface Props {
     documentType: DocumentType,
     onProgress: (pct: number) => void,
   ) => Promise<{ documentId: string }>;
-  onIndex: (documentId: string) => Promise<void>;
 }
 
-export function UploadZone({ onUpload, onIndex }: Props) {
+export function UploadZone({ onUpload }: Props) {
   const [documentType, setDocumentType] = useState<DocumentType>("Clinical Note");
   const [isDragging, setIsDragging] = useState(false);
   const [status, setStatus] = useState<UploadStatus>({
@@ -66,23 +65,15 @@ export function UploadZone({ onUpload, onIndex }: Props) {
 
       setStatus({ state: "uploading", progress: 0, filename: file.name });
       try {
-        const { documentId } = await onUpload(file, documentType, (pct) => {
+        await onUpload(file, documentType, (pct) => {
           setStatus((prev) => ({ ...prev, progress: pct }));
         });
 
         setStatus({
-          state: "embedding",
+          state: "queued",
           progress: 100,
           filename: file.name,
-          message: "Generating embeddings…",
-        });
-        await onIndex(documentId);
-
-        setStatus({
-          state: "done",
-          progress: 100,
-          filename: file.name,
-          message: "Indexed and ready to query.",
+          message: "Queued for PHI redaction, embedding, and entity extraction.",
         });
       } catch (err) {
         setStatus({
@@ -93,7 +84,7 @@ export function UploadZone({ onUpload, onIndex }: Props) {
         });
       }
     },
-    [documentType, onIndex, onUpload],
+    [documentType, onUpload],
   );
 
   return (
@@ -181,7 +172,9 @@ export function UploadZone({ onUpload, onIndex }: Props) {
                   ? "bg-clinical-ok/10 text-clinical-ok"
                   : status.state === "error"
                     ? "bg-clinical-risk/10 text-clinical-risk"
-                    : "bg-clinical-accent/10 text-clinical-accent",
+                    : status.state === "queued"
+                      ? "bg-clinical-warn/10 text-clinical-warn"
+                      : "bg-clinical-accent/10 text-clinical-accent",
               )}
             >
               {status.state}

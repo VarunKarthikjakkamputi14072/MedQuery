@@ -16,6 +16,17 @@ services:
       timeout: 5s
       retries: 10
 
+  redis:
+    image: redis:7-alpine
+    container_name: medquery-redis
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
   fastapi-backend:
     build: ./backend
     container_name: medquery-fastapi-backend
@@ -25,17 +36,50 @@ services:
       OPENAI_API_KEY: "${OPENAI_API_KEY:-}"
       OPENAI_EMBEDDING_MODEL: "${OPENAI_EMBEDDING_MODEL:-text-embedding-3-small}"
       OPENAI_CHAT_MODEL: "${OPENAI_CHAT_MODEL:-gpt-4o-mini}"
+      REDIS_URL: redis://redis:6379/0
+      INGEST_QUEUE_BACKEND: celery
+      REDACTION_PROVIDER: "${REDACTION_PROVIDER:-regex}"
       PINECONE_API_KEY: "${PINECONE_API_KEY:-}"
       PINECONE_INDEX: "${PINECONE_INDEX:-medquery}"
       PINECONE_CLOUD: "${PINECONE_CLOUD:-aws}"
       PINECONE_REGION: "${PINECONE_REGION:-us-east-1}"
+      PINECONE_METRIC: "${PINECONE_METRIC:-dotproduct}"
       CORS_ORIGINS: "http://localhost:3000"
       STORAGE_DIR: /data/storage
     depends_on:
       postgresql:
         condition: service_healthy
+      redis:
+        condition: service_healthy
     ports:
       - "8000:8000"
+    volumes:
+      - backend_data:/data
+
+  celery-worker:
+    build: ./backend
+    container_name: medquery-celery-worker
+    command: celery -A app.worker.celery_app worker --loglevel=info
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-medquery}:${POSTGRES_PASSWORD:-medquery}@postgresql:5432/${POSTGRES_DB:-medquery}
+      USE_FAKE_PROVIDERS: "${USE_FAKE_PROVIDERS:-true}"
+      OPENAI_API_KEY: "${OPENAI_API_KEY:-}"
+      OPENAI_EMBEDDING_MODEL: "${OPENAI_EMBEDDING_MODEL:-text-embedding-3-small}"
+      OPENAI_CHAT_MODEL: "${OPENAI_CHAT_MODEL:-gpt-4o-mini}"
+      REDIS_URL: redis://redis:6379/0
+      REDACTION_PROVIDER: "${REDACTION_PROVIDER:-regex}"
+      PINECONE_API_KEY: "${PINECONE_API_KEY:-}"
+      PINECONE_INDEX: "${PINECONE_INDEX:-medquery}"
+      PINECONE_CLOUD: "${PINECONE_CLOUD:-aws}"
+      PINECONE_REGION: "${PINECONE_REGION:-us-east-1}"
+      PINECONE_METRIC: "${PINECONE_METRIC:-dotproduct}"
+      STORAGE_DIR: /data/storage
+      INGEST_QUEUE_BACKEND: celery
+    depends_on:
+      postgresql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
     volumes:
       - backend_data:/data
 

@@ -20,7 +20,9 @@ interface Props {
 }
 
 export function DocumentCard({ document, onDelete, onEmbed, embedding }: Props) {
-  const indexed = document.pinecone_ids.length > 0;
+  const indexed = document.status === "indexed" || document.pinecone_ids.length > 0;
+  const failed = document.status === "failed";
+  const inFlight = document.status === "queued" || document.status === "processing";
   const tone =
     TYPE_COLORS[document.document_type] ??
     "bg-slate-500/10 text-slate-300 border-slate-500/40";
@@ -60,10 +62,13 @@ export function DocumentCard({ document, onDelete, onEmbed, embedding }: Props) 
               "rounded-md border px-2 py-1 font-mono text-[11px]",
               indexed
                 ? "border-clinical-ok/40 bg-clinical-ok/10 text-clinical-ok"
-                : "border-clinical-warn/40 bg-clinical-warn/10 text-clinical-warn",
+                : failed
+                  ? "border-clinical-risk/40 bg-clinical-risk/10 text-clinical-risk"
+                  : "border-clinical-warn/40 bg-clinical-warn/10 text-clinical-warn",
             )}
+            title={document.processing_error ?? undefined}
           >
-            {indexed ? "indexed" : "not indexed"}
+            {indexed ? "indexed" : inFlight ? document.status : failed ? "failed" : "not indexed"}
           </span>
         </div>
         <div className="flex items-center gap-2">
@@ -73,7 +78,7 @@ export function DocumentCard({ document, onDelete, onEmbed, embedding }: Props) 
           >
             Details
           </Link>
-          {!indexed && onEmbed && (
+          {!indexed && !inFlight && onEmbed && (
             <button
               type="button"
               onClick={() => onEmbed(document.id)}

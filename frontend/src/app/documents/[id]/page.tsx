@@ -93,7 +93,12 @@ export default function DocumentDetailPage() {
     );
   if (!document) return null;
 
-  const indexed = document.pinecone_ids.length > 0;
+  const indexed = document.status === "indexed" || document.pinecone_ids.length > 0;
+  const inFlight = document.status === "queued" || document.status === "processing";
+  const redactionTotal = Object.values(document.redaction_counts || {}).reduce(
+    (acc, value) => acc + value,
+    0,
+  );
 
   return (
     <div className="space-y-6">
@@ -115,7 +120,7 @@ export default function DocumentDetailPage() {
           </p>
         </div>
         <div className="flex items-center gap-2">
-          {!indexed && (
+          {!indexed && !inFlight && (
             <button
               type="button"
               onClick={handleEmbed}
@@ -146,14 +151,20 @@ export default function DocumentDetailPage() {
           {warning}
         </div>
       )}
+      {document.processing_error && (
+        <div className="rounded-lg border border-clinical-risk/50 bg-clinical-risk/10 p-3 text-xs text-clinical-risk">
+          {document.processing_error}
+        </div>
+      )}
 
-      <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
+      <div className="grid grid-cols-1 gap-3 sm:grid-cols-4">
         <Stat label="Chunks" value={document.chunk_count.toString()} />
         <Stat
           label="Vectors"
           value={document.pinecone_ids.length.toString()}
         />
         <Stat label="Status" value={document.status} />
+        <Stat label="PHI redactions" value={redactionTotal.toString()} />
       </div>
 
       <EntitySummaryPanel

@@ -8,6 +8,13 @@ from threading import RLock
 from typing import Any, Dict, List, Optional, Protocol
 
 from app.core.config import get_settings
+from app.services.hybrid_search import (
+    DEFAULT_ALPHA,
+    SparseVector,
+    combine_dense_sparse,
+    scale_sparse_vector,
+    sparse_dot,
+)
 
 PINECONE_UPSERT_BATCH = 100
 PINECONE_FREE_TIER_LIMIT = 100_000
@@ -18,6 +25,8 @@ class VectorMatch:
     id: str
     score: float
     metadata: Dict[str, Any]
+    dense_score: float | None = None
+    sparse_score: float = 0.0
 
 
 @dataclass
@@ -25,6 +34,7 @@ class VectorRecord:
     id: str
     values: List[float]
     metadata: Dict[str, Any] = field(default_factory=dict)
+    sparse_values: SparseVector | None = None
 
 
 class VectorStore(Protocol):
@@ -35,6 +45,8 @@ class VectorStore(Protocol):
         vector: List[float],
         top_k: int = 5,
         document_ids: Optional[List[str]] = None,
+        sparse_vector: SparseVector | None = None,
+        alpha: float = DEFAULT_ALPHA,
     ) -> List[VectorMatch]: ...
 
     async def delete(self, ids: List[str]) -> None: ...
@@ -70,6 +82,8 @@ class InMemoryVectorStore:
         vector: List[float],
         top_k: int = 5,
         document_ids: Optional[List[str]] = None,
+        sparse_vector: SparseVector | None = None,
+        alpha: float = DEFAULT_ALPHA,
     ) -> List[VectorMatch]:
         with self._lock:
             candidates = list(self._records.values())
@@ -78,10 +92,24 @@ class InMemoryVectorStore:
             allowed = set(document_ids)
             candidates = [r for r in candidates if r.metadata.get("document_id") in allowed]
 
-        scored = [
-            VectorMatch(id=r.id, score=_cosine(vector, r.values), metadata=r.metadata)
-            for r in candidates
-        ]
+        scored: list[VectorMatch] = []
+        for record in candidates:
+            dense_score = _cosine(vector, record.values)
+            sparse_score = sparse_dot(sparse_vector, record.sparse_values)
+            score = (
+                combine_dense_sparse(dense_score, sparse_score, alpha=alpha)
+                if sparse_vector
+                else dense_score
+            )
+            scored.append(
+                VectorMatch(
+                    id=record.id,
+                    score=score,
+                    metadata=record.metadata,
+                    dense_score=dense_score,
+                    sparse_score=sparse_score,
+                )
+            )
         scored.sort(key=lambda m: m.score, reverse=True)
         return scored[:top_k]
 
@@ -105,6 +133,7 @@ class PineconeVectorStore:
         cloud: str,
         region: str,
         dimension: int,
+        metric: str,
     ) -> None:
         from pinecone import Pinecone, ServerlessSpec
 
@@ -114,7 +143,7 @@ class PineconeVectorStore:
             self._pc.create_index(
                 name=index_name,
                 dimension=dimension,
-                metric="cosine",
+                metric=metric,
                 spec=ServerlessSpec(cloud=cloud, region=region),
             )
         self._index = self._pc.Index(index_name)
@@ -125,7 +154,13 @@ class PineconeVectorStore:
         # Pinecone caps each upsert request at 100 vectors.
         for batch in _batch(records, PINECONE_UPSERT_BATCH):
             payload = [
-                {"id": r.id, "values": r.values, "metadata": r.metadata} for r in batch
+                {
+                    "id": r.id,
+                    "values": r.values,
+                    "metadata": r.metadata,
+                    **({"sparse_values": r.sparse_values} if r.sparse_values else {}),
+                }
+                for r in batch
             ]
             await asyncio.to_thread(self._index.upsert, vectors=payload)
 
@@ -134,18 +169,29 @@ class PineconeVectorStore:
         vector: List[float],
         top_k: int = 5,
         document_ids: Optional[List[str]] = None,
+        sparse_vector: SparseVector | None = None,
+        alpha: float = DEFAULT_ALPHA,
     ) -> List[VectorMatch]:
         filter_: Dict[str, Any] | None = None
         if document_ids:
             filter_ = {"document_id": {"$in": list(document_ids)}}
 
-        response = await asyncio.to_thread(
-            self._index.query,
-            vector=vector,
-            top_k=top_k,
-            include_metadata=True,
-            filter=filter_,
-        )
+        query_kwargs: Dict[str, Any] = {
+            "vector": [value * alpha for value in vector] if sparse_vector else vector,
+            "top_k": top_k,
+            "include_metadata": True,
+            "filter": filter_,
+        }
+        if sparse_vector:
+            query_kwargs["sparse_vector"] = scale_sparse_vector(sparse_vector, 1.0 - alpha)
+
+        try:
+            response = await asyncio.to_thread(self._index.query, **query_kwargs)
+        except Exception:
+            # Existing cosine-only indexes cannot accept sparse query payloads.
+            # Fall back to dense retrieval rather than failing the clinical query.
+            query_kwargs.pop("sparse_vector", None)
+            response = await asyncio.to_thread(self._index.query, **query_kwargs)
         return [
             VectorMatch(id=m["id"], score=float(m["score"]), metadata=m.get("metadata") or {})
             for m in response.get("matches", [])
@@ -187,6 +233,7 @@ def get_vector_store() -> VectorStore:
             cloud=settings.pinecone_cloud,
             region=settings.pinecone_region,
             dimension=EMBEDDING_DIM,
+            metric=settings.pinecone_metric,
         )
     return _singleton_store
 

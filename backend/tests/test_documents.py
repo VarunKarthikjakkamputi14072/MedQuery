@@ -22,10 +22,11 @@ async def test_upload_extracts_chunks_and_lists_document(client):
     data = {"document_type": "Clinical Note"}
 
     response = await client.post("/upload", files=files, data=data)
-    assert response.status_code == 200, response.text
+    assert response.status_code == 202, response.text
     body = response.json()
     assert body["document"]["filename"] == "note.txt"
-    assert body["document"]["chunk_count"] >= 1
+    assert body["document"]["status"] == "queued"
+    assert body["task_id"]
     assert body["preview"]
 
     listing = await client.get("/documents")
@@ -33,6 +34,8 @@ async def test_upload_extracts_chunks_and_lists_document(client):
     docs = listing.json()
     assert len(docs) == 1
     assert docs[0]["document_type"] == "Clinical Note"
+    assert docs[0]["status"] == "indexed"
+    assert docs[0]["chunk_count"] >= 1
 
 
 @pytest.mark.asyncio
@@ -50,7 +53,7 @@ async def test_upload_rejects_invalid_document_type(client):
 
 
 @pytest.mark.asyncio
-async def test_upload_rejects_scanned_pdf(client):
+async def test_upload_marks_scanned_pdf_failed(client):
     # Minimal valid PDF with no extractable text (no /Contents stream).
     pdf_bytes = (
         b"%PDF-1.4\n"
@@ -65,15 +68,21 @@ async def test_upload_rejects_scanned_pdf(client):
     response = await client.post(
         "/upload", files=files, data={"document_type": "Clinical Note"}
     )
-    assert response.status_code == 422
-    assert "Scanned PDF" in response.json()["detail"]
+    assert response.status_code == 202
+    document_id = response.json()["document"]["id"]
+
+    document = await client.get(f"/documents/{document_id}")
+    assert document.status_code == 200
+    body = document.json()
+    assert body["status"] == "failed"
+    assert "Scanned PDF" in body["processing_error"]
 
 
 @pytest.mark.asyncio
 async def test_embed_and_query_round_trip(client):
     files = {"file": ("note.txt", io.BytesIO(SAMPLE_TEXT.encode("utf-8")), "text/plain")}
     upload = await client.post("/upload", files=files, data={"document_type": "Discharge Summary"})
-    assert upload.status_code == 200
+    assert upload.status_code == 202
     document_id = upload.json()["document"]["id"]
 
     embed = await client.post("/embed", json={"document_id": document_id})
@@ -95,6 +104,8 @@ async def test_embed_and_query_round_trip(client):
     assert qbody["risk_flag"] is True
     assert "sepsis" in qbody["risk_flags"]
     assert qbody["latency_ms"] >= 0
+    assert "John Doe" not in qbody["citations"][0]["text"]
+    assert "[REDACTED_PERSON]" in qbody["citations"][0]["text"]
 
     # Chunks should be unique by content after dedupe.
     chunk_ids = [c["chunk_id"] for c in qbody["citations"]]
