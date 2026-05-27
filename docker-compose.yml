@@ -1,0 +1,49 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: medquery
+      POSTGRES_PASSWORD: medquery
+      POSTGRES_DB: medquery
+    ports:
+      - "5432:5432"
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U medquery"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  backend:
+    build: ./backend
+    environment:
+      DATABASE_URL: postgresql+asyncpg://medquery:medquery@postgres:5432/medquery
+      USE_FAKE_PROVIDERS: "${USE_FAKE_PROVIDERS:-true}"
+      OPENAI_API_KEY: "${OPENAI_API_KEY:-}"
+      OPENAI_EMBEDDING_MODEL: "${OPENAI_EMBEDDING_MODEL:-text-embedding-3-small}"
+      OPENAI_CHAT_MODEL: "${OPENAI_CHAT_MODEL:-gpt-4o-mini}"
+      PINECONE_API_KEY: "${PINECONE_API_KEY:-}"
+      PINECONE_INDEX: "${PINECONE_INDEX:-medquery}"
+      CORS_ORIGINS: "http://localhost:3000"
+      STORAGE_DIR: /data/storage
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "8000:8000"
+    volumes:
+      - backend_data:/data
+
+  frontend:
+    build: ./frontend
+    environment:
+      NEXT_PUBLIC_API_URL: "http://localhost:8000"
+    depends_on:
+      - backend
+    ports:
+      - "3000:3000"
+
+volumes:
+  pg_data:
+  backend_data:
