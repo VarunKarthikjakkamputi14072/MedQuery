@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import List
+from typing import List, Optional
 
 from pydantic import BaseModel, ConfigDict
 
@@ -40,3 +40,4 @@ class EmbedResponse(BaseModel):
     document_id: str
     chunk_count: int
     pinecone_ids: List[str]
+    warning: Optional[str] = None

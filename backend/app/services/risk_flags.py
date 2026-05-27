@@ -1,47 +1,50 @@
-"""Lightweight keyword-based risk flag detection for clinical documents."""
+"""Keyword-based risk flag detection for clinical responses."""
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
 from typing import Iterable, List
 
-RISK_TERMS: List[str] = [
-    "sepsis",
-    "hemorrhage",
-    "haemorrhage",
-    "stroke",
-    "myocardial infarction",
-    "anaphylaxis",
-    "respiratory failure",
-    "cardiac arrest",
-    "suicidal",
-    "overdose",
-    "shock",
-    "pulmonary embolism",
-    "dka",
-    "diabetic ketoacidosis",
-    "code blue",
-    "stat",
+# Required high-risk term list. Matching is case-insensitive but order-preserving.
+HIGH_RISK_TERMS: List[str] = [
     "critical",
-    "tachycardia",
-    "hypotension",
-    "hypoxia",
-    "fever",
-    "elevated troponin",
-    "allergic reaction",
+    "STAT",
+    "emergency",
+    "sepsis",
+    "deteriorating",
+    "DNR",
+    "code blue",
 ]
 
 _PATTERN = re.compile(
-    r"\b(" + "|".join(re.escape(term) for term in RISK_TERMS) + r")\b",
+    r"\b(" + "|".join(re.escape(term) for term in HIGH_RISK_TERMS) + r")\b",
     re.IGNORECASE,
 )
 
 
-def detect_risk_flags(texts: Iterable[str]) -> List[str]:
-    """Return a sorted, de-duplicated list of risk terms found across the texts."""
-    found: set[str] = set()
+@dataclass
+class RiskAssessment:
+    risk_flag: bool
+    matched_terms: List[str]
+
+
+def detect_risk_flags(texts: Iterable[str]) -> RiskAssessment:
+    """Scan inputs for high-risk clinical terms.
+
+    Returns the canonical (originally-cased) matched terms in the order they
+    appear in HIGH_RISK_TERMS, along with a boolean `risk_flag`.
+    """
+    canonical_by_lower = {term.lower(): term for term in HIGH_RISK_TERMS}
+    found_lower: set[str] = set()
     for text in texts:
         if not text:
             continue
         for match in _PATTERN.findall(text):
-            found.add(match.lower())
-    return sorted(found)
+            found_lower.add(match.lower())
+
+    matched = [
+        canonical_by_lower[term.lower()]
+        for term in HIGH_RISK_TERMS
+        if term.lower() in found_lower
+    ]
+    return RiskAssessment(risk_flag=bool(matched), matched_terms=matched)
