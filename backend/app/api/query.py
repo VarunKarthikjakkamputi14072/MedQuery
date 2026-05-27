@@ -13,20 +13,43 @@ from app.core.config import get_settings
 from app.models.query import Query
 from app.models.session import Session as ChatSession
 from app.schemas.query import Citation, QueryHistoryItem, QueryRequest, QueryResponse
+from app.services.dedup import dedupe_matches
 from app.services.embeddings import EmbeddingProvider
-from app.services.llm import SYSTEM_PROMPT, ChatProvider, ContextSnippet, build_user_prompt
+from app.services.llm import (
+    SYSTEM_PROMPT,
+    ChatProvider,
+    ContextSnippet,
+    TurnHistory,
+    build_user_prompt,
+)
 from app.services.risk_flags import detect_risk_flags
 from app.services.vector_store import VectorStore
 
 router = APIRouter(tags=["query"])
 
+HISTORY_TURNS = 3
+
 
 def _confidence_from_scores(scores: List[float]) -> float:
-    """Average top scores, clipped into [0, 1]."""
     if not scores:
         return 0.0
     avg = sum(scores) / len(scores)
     return max(0.0, min(1.0, float(avg)))
+
+
+async def _recent_history(
+    session: AsyncSession, session_id: str, limit: int = HISTORY_TURNS
+) -> list[TurnHistory]:
+    rows = (
+        await session.execute(
+            select(Query.question, Query.answer)
+            .where(Query.session_id == session_id)
+            .order_by(Query.timestamp.desc())
+            .limit(limit)
+        )
+    ).all()
+    # rows are newest first; flip so prompt reads oldest -> newest.
+    return [TurnHistory(question=q, answer=a) for q, a in reversed(rows)]
 
 
 @router.post("/query", response_model=QueryResponse)
@@ -52,11 +75,17 @@ async def query(
 
     document_ids = payload.document_ids or chat_session.document_ids or None
 
+    history = await _recent_history(session, chat_session.id)
+
     started = time.perf_counter()
     [query_vector] = await embedder.embed([payload.question])
-    matches = await vector_store.query(
-        query_vector, top_k=top_k, document_ids=document_ids
+    raw_matches = await vector_store.query(
+        query_vector,
+        # Retrieve a few extras so dedupe leaves us with enough context.
+        top_k=max(top_k * 2, top_k + 2),
+        document_ids=document_ids,
     )
+    matches = dedupe_matches(raw_matches)[:top_k]
 
     citations: List[Citation] = []
     snippets: List[ContextSnippet] = []
@@ -77,12 +106,14 @@ async def query(
         )
         snippets.append(ContextSnippet(label=label, text=text))
 
-    user_prompt = build_user_prompt(payload.question, snippets)
+    user_prompt = build_user_prompt(payload.question, snippets, history=history)
     answer = await chat.complete(SYSTEM_PROMPT, user_prompt)
     latency_ms = int((time.perf_counter() - started) * 1000)
 
     confidence = _confidence_from_scores([c.score for c in citations])
-    risk_flags = detect_risk_flags([payload.question, answer, *(c.text for c in citations)])
+    risk = detect_risk_flags(
+        [payload.question, answer, *(c.text for c in citations)]
+    )
 
     record = Query(
         session_id=chat_session.id,
@@ -104,7 +135,8 @@ async def query(
         citations=citations,
         confidence=confidence,
         latency_ms=latency_ms,
-        risk_flags=risk_flags,
+        risk_flag=risk.risk_flag,
+        risk_flags=risk.matched_terms,
         timestamp=record.timestamp,
     )
 
