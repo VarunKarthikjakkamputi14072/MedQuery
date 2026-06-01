@@ -1,0 +1,45 @@
+{
+  "documents": [
+    {
+      "id": "doc-discharge",
+      "name": "Discharge Summary.txt",
+      "type": "Discharge Summary",
+      "chunks": [
+        "Patient is a 58-year-old male admitted for evaluation of poorly controlled blood glucose and fatigue over the preceding three weeks.",
+        "Primary diagnosis on this admission is Type 2 diabetes mellitus with secondary hypertension. No evidence of diabetic ketoacidosis on presentation.",
+        "Most recent laboratory results show an HbA1c of 8.2 percent, fasting glucose of 168 mg/dL, and an LDL cholesterol of 134 mg/dL.",
+        "On discharge the patient was started on metformin 500 mg twice daily and lisinopril 10 mg once daily for blood pressure control.",
+        "Blood pressure at discharge was 148/92 mmHg. The patient was counseled on dietary changes and home glucose monitoring.",
+        "Follow-up with the primary care physician was scheduled in two weeks, with repeat HbA1c and a basic metabolic panel ordered at that visit."
+      ]
+    },
+    {
+      "id": "doc-radiology",
+      "name": "Chest Xray Report.txt",
+      "type": "Radiology Report",
+      "chunks": [
+        "Examination: PA and lateral chest radiograph performed for evaluation of cough and shortness of breath.",
+        "The lungs are clear without focal consolidation, effusion, or pneumothorax. The cardiomediastinal silhouette is within normal limits.",
+        "Impression: No acute cardiopulmonary process. No radiographic evidence of pneumonia at this time."
+      ]
+    },
+    {
+      "id": "doc-labs",
+      "name": "Lab Panel.txt",
+      "type": "Lab Report",
+      "chunks": [
+        "Complete blood count: hemoglobin 13.1 g/dL, white blood cell count 7.4 thousand per microliter, platelets 245 thousand per microliter.",
+        "Basic metabolic panel: sodium 139 mmol/L, potassium 4.2 mmol/L, and creatinine 1.1 mg/dL indicating preserved renal function.",
+        "Liver function tests were within normal limits with ALT 28 U/L and AST 24 U/L."
+      ]
+    }
+  ],
+  "questions": [
+    {"q": "What was the patient's HbA1c level?", "gold": ["doc-discharge:2"]},
+    {"q": "Which medication was prescribed for the patient's diabetes?", "gold": ["doc-discharge:3"]},
+    {"q": "What was the blood pressure reading at discharge?", "gold": ["doc-discharge:4"]},
+    {"q": "What did the chest X-ray show?", "gold": ["doc-radiology:1", "doc-radiology:2"]},
+    {"q": "What was the creatinine value?", "gold": ["doc-labs:1"]},
+    {"q": "What was the primary diagnosis on admission?", "gold": ["doc-discharge:1"]}
+  ]
+}
