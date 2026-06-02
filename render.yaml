@@ -1,0 +1,27 @@
+# Render Blueprint for the MedQuery backend.
+# Connect this repo in the Render dashboard ("New +" -> "Blueprint") and it will
+# provision the service below. The demo runs entirely on the built-in fakes
+# (USE_FAKE_PROVIDERS=true) over SQLite, so no API keys or database are required.
+services:
+  - type: web
+    name: medquery-backend
+    runtime: docker
+    dockerfilePath: ./backend/Dockerfile
+    dockerContext: ./backend
+    plan: free
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      # Run the full pipeline with deterministic fakes — zero cost, no secrets.
+      - key: USE_FAKE_PROVIDERS
+        value: "true"
+      - key: USE_HYBRID_RETRIEVAL
+        value: "true"
+      # SQLite on the ephemeral disk is fine for a demo (resets on redeploy).
+      - key: DATABASE_URL
+        value: sqlite+aiosqlite:////tmp/medquery.db
+      - key: STORAGE_DIR
+        value: /tmp/storage
+      # Set this to the deployed Vercel URL after the frontend is live.
+      - key: CORS_ORIGINS
+        sync: false

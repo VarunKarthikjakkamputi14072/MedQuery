@@ -41,6 +41,9 @@ class Settings(BaseSettings):
     top_k: int = 5
     max_upload_mb: int = 10
 
+    # Fuse vector search with a BM25 lexical arm (Reciprocal Rank Fusion).
+    use_hybrid_retrieval: bool = True
+
     @field_validator("cors_origins", mode="before")
     @classmethod
     def _split_cors(cls, value):

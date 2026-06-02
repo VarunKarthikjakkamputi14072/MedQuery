@@ -10,11 +10,15 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import chat_dep, embedding_dep, session_dep, vector_dep
 from app.core.config import get_settings
+from app.models.chunk import Chunk
+from app.models.document import Document
 from app.models.query import Query
 from app.models.session import Session as ChatSession
 from app.schemas.query import Citation, QueryHistoryItem, QueryRequest, QueryResponse
 from app.services.dedup import dedupe_matches
 from app.services.embeddings import EmbeddingProvider
+from app.services.fusion import reciprocal_rank_fusion
+from app.services.lexical import keyword_search
 from app.services.llm import (
     SYSTEM_PROMPT,
     ChatProvider,
@@ -23,11 +27,83 @@ from app.services.llm import (
     build_user_prompt,
 )
 from app.services.risk_flags import detect_risk_flags
-from app.services.vector_store import VectorStore
+from app.services.vector_store import VectorMatch, VectorStore
 
 router = APIRouter(tags=["query"])
 
 HISTORY_TURNS = 3
+
+
+async def _resolve_lexical_matches(
+    session: AsyncSession, ids: List[str]
+) -> dict[str, VectorMatch]:
+    """Build VectorMatch objects for chunk ids that only the lexical arm found."""
+    if not ids:
+        return {}
+    rows = (
+        await session.execute(
+            select(Chunk, Document.filename)
+            .join(Document, Chunk.document_id == Document.id)
+            .where(Chunk.id.in_(ids))
+        )
+    ).all()
+    resolved: dict[str, VectorMatch] = {}
+    for chunk, filename in rows:
+        resolved[chunk.id] = VectorMatch(
+            id=chunk.id,
+            # Lexical-only hit: no cosine score. Confidence is computed from
+            # vector scores, so leaving this at 0.0 keeps it out of that average.
+            score=0.0,
+            metadata={
+                "document_id": chunk.document_id,
+                "document_name": filename,
+                "chunk_index": chunk.chunk_index,
+                "page": chunk.page,
+                "text": chunk.text,
+            },
+        )
+    return resolved
+
+
+async def retrieve_matches(
+    session: AsyncSession,
+    embedder: EmbeddingProvider,
+    vector_store: VectorStore,
+    question: str,
+    document_ids: List[str] | None,
+    top_k: int,
+    hybrid: bool,
+) -> List[VectorMatch]:
+    """Vector retrieval, optionally fused with a BM25 lexical arm via RRF.
+
+    Shared by the /query endpoint and the evaluation harness so both measure the
+    same retrieval path.
+    """
+    pool = max(top_k * 4, 20)
+    [query_vector] = await embedder.embed([question])
+    vector_matches = await vector_store.query(
+        query_vector, top_k=pool, document_ids=document_ids
+    )
+
+    if not hybrid:
+        return dedupe_matches(vector_matches)[:top_k]
+
+    lexical = await keyword_search(session, question, document_ids=document_ids, top_k=pool)
+    vector_ids = [m.id for m in vector_matches]
+    lexical_ids = [cid for cid, _ in lexical]
+    fused = reciprocal_rank_fusion([vector_ids, lexical_ids])
+
+    vec_by_id = {m.id: m for m in vector_matches}
+    missing = [cid for cid, _ in fused if cid not in vec_by_id]
+    lex_by_id = await _resolve_lexical_matches(session, missing)
+
+    ordered: List[VectorMatch] = []
+    for cid, _ in fused:
+        match = vec_by_id.get(cid) or lex_by_id.get(cid)
+        if match is not None:
+            ordered.append(match)
+
+    return dedupe_matches(ordered)[:top_k]
 
 
 def _confidence_from_scores(scores: List[float]) -> float:
@@ -78,14 +154,15 @@ async def query(
     history = await _recent_history(session, chat_session.id)
 
     started = time.perf_counter()
-    [query_vector] = await embedder.embed([payload.question])
-    raw_matches = await vector_store.query(
-        query_vector,
-        # Retrieve a few extras so dedupe leaves us with enough context.
-        top_k=max(top_k * 2, top_k + 2),
-        document_ids=document_ids,
+    matches = await retrieve_matches(
+        session,
+        embedder,
+        vector_store,
+        payload.question,
+        document_ids,
+        top_k=top_k,
+        hybrid=settings.use_hybrid_retrieval,
     )
-    matches = dedupe_matches(raw_matches)[:top_k]
 
     citations: List[Citation] = []
     snippets: List[ContextSnippet] = []
@@ -110,7 +187,9 @@ async def query(
     answer = await chat.complete(SYSTEM_PROMPT, user_prompt)
     latency_ms = int((time.perf_counter() - started) * 1000)
 
-    confidence = _confidence_from_scores([c.score for c in citations])
+    # Confidence is derived from vector similarity; lexical-only hits (score 0)
+    # are excluded so they don't drag the average down.
+    confidence = _confidence_from_scores([c.score for c in citations if c.score > 0])
     risk = detect_risk_flags(
         [payload.question, answer, *(c.text for c in citations)]
     )

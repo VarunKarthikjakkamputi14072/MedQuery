@@ -26,6 +26,7 @@ from app.api.deps import (
     vector_dep,
 )
 from app.core.config import get_settings
+from app.models.chunk import Chunk
 from app.models.document import Document
 from app.models.entity import Entity
 from app.schemas.document import (
@@ -135,9 +136,10 @@ async def delete_document(
     if document.storage_path:
         await storage.delete(document.storage_path)
 
-    # Cascade-delete entities (works on both Postgres FK ON DELETE CASCADE and
-    # SQLite where the FK isn't enforced).
+    # Cascade-delete entities + chunks (works on both Postgres FK ON DELETE
+    # CASCADE and SQLite where the FK isn't enforced).
     await session.execute(sa_delete(Entity).where(Entity.document_id == document_id))
+    await session.execute(sa_delete(Chunk).where(Chunk.document_id == document_id))
 
     await session.delete(document)
     await session.commit()
@@ -231,6 +233,10 @@ async def embed_document(
         logger.warning(warning)
 
     vectors = await embedder.embed([c.text for c in chunks])
+
+    # Re-embed: drop any chunks persisted from a previous run for this document.
+    await session.execute(sa_delete(Chunk).where(Chunk.document_id == document.id))
+
     records: list[VectorRecord] = []
     pinecone_ids: list[str] = []
     for chunk, vector in zip(chunks, vectors):
@@ -248,6 +254,17 @@ async def embed_document(
                     "page": chunk.page or 1,
                     "text": chunk.text,
                 },
+            )
+        )
+        # Persist the chunk text for the lexical retrieval arm + eval harness.
+        # The id matches the vector id so the two arms fuse on a shared key.
+        session.add(
+            Chunk(
+                id=vec_id,
+                document_id=document.id,
+                chunk_index=chunk.index,
+                page=chunk.page or 1,
+                text=chunk.text,
             )
         )
 
