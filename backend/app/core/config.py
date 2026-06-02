@@ -4,7 +4,7 @@ from __future__ import annotations
 from functools import lru_cache
 from typing import List
 
-from pydantic import Field, field_validator
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -32,7 +32,11 @@ class Settings(BaseSettings):
 
     storage_dir: str = "./storage"
 
-    cors_origins: List[str] = Field(default_factory=lambda: ["http://localhost:3000"])
+    # Plain string (not List) so pydantic-settings does not JSON-decode the env
+    # value — a comma-separated string like
+    # "http://localhost:3000,https://app.vercel.app" just works. Consumers read
+    # the parsed list via the `cors_origins_list` property below.
+    cors_origins: str = "http://localhost:3000"
 
     use_fake_providers: bool = True
 
@@ -44,12 +48,10 @@ class Settings(BaseSettings):
     # Fuse vector search with a BM25 lexical arm (Reciprocal Rank Fusion).
     use_hybrid_retrieval: bool = True
 
-    @field_validator("cors_origins", mode="before")
-    @classmethod
-    def _split_cors(cls, value):
-        if isinstance(value, str):
-            return [origin.strip() for origin in value.split(",") if origin.strip()]
-        return value
+    @property
+    def cors_origins_list(self) -> List[str]:
+        """Parse the comma-separated cors_origins string into a list."""
+        return [o.strip() for o in self.cors_origins.split(",") if o.strip()]
 
 
 @lru_cache
