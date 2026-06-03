@@ -38,7 +38,12 @@ class Settings(BaseSettings):
     # the parsed list via the `cors_origins_list` property below.
     cors_origins: str = "http://localhost:3000"
 
-    use_fake_providers: bool = True
+    # Explicit override to force the deterministic fakes even when keys are set
+    # (used by the test suite / for a zero-cost demo). Default off: each provider
+    # auto-detects from whether its key is present (see the resolver properties
+    # below). So setting OPENAI_API_KEY alone switches the real LLM + embeddings
+    # on, and PINECONE_API_KEY is optional (in-memory vector store otherwise).
+    use_fake_providers: bool = False
 
     chunk_size: int = 512
     chunk_overlap: int = 50
@@ -52,6 +57,25 @@ class Settings(BaseSettings):
     def cors_origins_list(self) -> List[str]:
         """Parse the comma-separated cors_origins string into a list."""
         return [o.strip() for o in self.cors_origins.split(",") if o.strip()]
+
+    # --- Per-provider resolution (single source of truth for the factories) ---
+    @property
+    def use_real_openai(self) -> bool:
+        """Real OpenAI embeddings + chat when a key is set and fakes aren't forced."""
+        return not self.use_fake_providers and bool(self.openai_api_key)
+
+    @property
+    def use_real_pinecone(self) -> bool:
+        """Real Pinecone vector store when a key is set and fakes aren't forced."""
+        return not self.use_fake_providers and bool(self.pinecone_api_key)
+
+    def provider_status(self) -> dict:
+        """Which backend each provider is currently using (for /health + debugging)."""
+        return {
+            "embeddings": "openai" if self.use_real_openai else "fake",
+            "llm": "openai" if self.use_real_openai else "fake",
+            "vector_store": "pinecone" if self.use_real_pinecone else "in-memory",
+        }
 
 
 @lru_cache

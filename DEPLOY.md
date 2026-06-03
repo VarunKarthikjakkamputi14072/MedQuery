@@ -35,7 +35,21 @@ before `vercel --prod`. Re-deploy if you change it.
 Set `CORS_ORIGINS` on the Render backend to the production Vercel URL
 (e.g. `https://medquery.vercel.app`) and redeploy so the browser can call the API.
 
-## Going beyond the demo
+## Going beyond the demo (real inference)
 
-To use real inference, set `USE_FAKE_PROVIDERS=false` and provide `OPENAI_API_KEY`
-+ `PINECONE_API_KEY` (and a Postgres `DATABASE_URL`) on the backend service.
+Providers auto-detect from whichever keys are present — no all-or-nothing flag:
+
+| You set | Result |
+| --- | --- |
+| nothing | deterministic fakes (the zero-cost demo) |
+| `OPENAI_API_KEY` | **real GPT-4o-mini + embeddings** — actually reads citations and writes conversational answers; vector search uses the built-in in-memory store |
+| `OPENAI_API_KEY` + `PINECONE_API_KEY` | as above, but backed by a real Pinecone index |
+
+So to turn on the real "brain", just set `OPENAI_API_KEY` on the Render service —
+**Pinecone is optional.** (If the service still has `USE_FAKE_PROVIDERS=true` from the
+demo, remove it or set it to `false`; that flag force-pins the fakes on.)
+
+`GET /health` reports the active backend per provider, e.g.
+`{"providers": {"embeddings": "openai", "llm": "openai", "vector_store": "in-memory"}}`.
+
+For persistence across redeploys, also set a Postgres `DATABASE_URL`.

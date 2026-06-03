@@ -176,7 +176,7 @@ def get_vector_store() -> VectorStore:
         return _singleton_store
 
     settings = get_settings()
-    if settings.use_fake_providers or not settings.pinecone_api_key:
+    if not settings.use_real_pinecone:
         _singleton_store = InMemoryVectorStore()
     else:
         from app.services.embeddings import EMBEDDING_DIM

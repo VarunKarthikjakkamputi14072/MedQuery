@@ -67,6 +67,6 @@ class OpenAIEmbeddingProvider:
 
 def get_embedding_provider() -> EmbeddingProvider:
     settings = get_settings()
-    if settings.use_fake_providers or not settings.openai_api_key:
+    if not settings.use_real_openai:
         return FakeEmbeddingProvider()
     return OpenAIEmbeddingProvider(settings.openai_api_key, settings.openai_embedding_model)
