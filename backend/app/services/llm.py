@@ -100,12 +100,15 @@ class FakeChatProvider:
         )
 
 
-class OpenAIChatProvider:
-    def __init__(self, api_key: str, model: str) -> None:
+class OpenAICompatibleChatProvider:
+    """Works with any OpenAI-compatible endpoint (OpenAI, Groq, OpenRouter, etc.)."""
+
+    def __init__(self, api_key: str, model: str, base_url: str | None = None, label: str = "llm") -> None:
         from openai import AsyncOpenAI
 
-        self._client = AsyncOpenAI(api_key=api_key)
+        self._client = AsyncOpenAI(api_key=api_key, base_url=base_url)
         self._model = model
+        self._label = label
 
     async def complete(self, system_prompt: str, user_prompt: str) -> str:
         async def _call() -> str:
@@ -119,11 +122,31 @@ class OpenAIChatProvider:
             )
             return response.choices[0].message.content or ""
 
-        return await retry_async(_call, label="openai.chat")
+        return await retry_async(_call, label=self._label)
 
 
 def get_chat_provider() -> ChatProvider:
     settings = get_settings()
-    if not settings.use_real_openai:
-        return FakeChatProvider()
-    return OpenAIChatProvider(settings.openai_api_key, settings.openai_chat_model)
+    provider = settings.active_llm_provider
+
+    if provider == "groq":
+        return OpenAICompatibleChatProvider(
+            api_key=settings.groq_api_key,
+            model=settings.groq_chat_model,
+            base_url="https://api.groq.com/openai/v1",
+            label="groq.chat",
+        )
+    if provider == "openrouter":
+        return OpenAICompatibleChatProvider(
+            api_key=settings.openrouter_api_key,
+            model=settings.openrouter_chat_model,
+            base_url="https://openrouter.ai/api/v1",
+            label="openrouter.chat",
+        )
+    if provider == "openai":
+        return OpenAICompatibleChatProvider(
+            api_key=settings.openai_api_key,
+            model=settings.openai_chat_model,
+            label="openai.chat",
+        )
+    return FakeChatProvider()

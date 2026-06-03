@@ -25,6 +25,12 @@ class Settings(BaseSettings):
     openai_embedding_model: str = "text-embedding-3-small"
     openai_chat_model: str = "gpt-4o-mini"
 
+    groq_api_key: str = ""
+    groq_chat_model: str = "llama-3.3-70b-versatile"
+
+    openrouter_api_key: str = ""
+    openrouter_chat_model: str = "meta-llama/llama-3.3-70b-instruct:free"
+
     pinecone_api_key: str = ""
     pinecone_index: str = "medquery"
     pinecone_cloud: str = "aws"
@@ -69,11 +75,24 @@ class Settings(BaseSettings):
         """Real Pinecone vector store when a key is set and fakes aren't forced."""
         return not self.use_fake_providers and bool(self.pinecone_api_key)
 
+    @property
+    def active_llm_provider(self) -> str:
+        """Which LLM backend will be used: groq > openrouter > openai > fake."""
+        if self.use_fake_providers:
+            return "fake"
+        if self.groq_api_key:
+            return "groq"
+        if self.openrouter_api_key:
+            return "openrouter"
+        if self.openai_api_key:
+            return "openai"
+        return "fake"
+
     def provider_status(self) -> dict:
         """Which backend each provider is currently using (for /health + debugging)."""
         return {
             "embeddings": "openai" if self.use_real_openai else "fake",
-            "llm": "openai" if self.use_real_openai else "fake",
+            "llm": self.active_llm_provider,
             "vector_store": "pinecone" if self.use_real_pinecone else "in-memory",
         }
 
