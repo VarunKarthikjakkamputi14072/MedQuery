@@ -124,6 +124,6 @@ class OpenAIChatProvider:
 
 def get_chat_provider() -> ChatProvider:
     settings = get_settings()
-    if settings.use_fake_providers or not settings.openai_api_key:
+    if not settings.use_real_openai:
         return FakeChatProvider()
     return OpenAIChatProvider(settings.openai_api_key, settings.openai_chat_model)
