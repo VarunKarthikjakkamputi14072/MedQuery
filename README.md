@@ -265,3 +265,4 @@ list of high-risk clinical terms — `critical`, `STAT`, `emergency`,
 `sepsis`, `deteriorating`, `DNR`, `code blue` — and the UI raises a
 prominent warning banner whenever any are matched. The system
 explicitly does **not** provide medical advice.
+ 
