@@ -100,3 +100,21 @@ def test_entity_extraction_regex_backend():
     assert "lab_value" in types
     assert "pneumonia" in texts
     assert any("wbc" in t for t in texts)
+
+
+def test_reciprocal_rank_fusion():
+    from app.services.fusion import reciprocal_rank_fusion
+
+    ranking1 = ["docA", "docB", "docC"]
+    ranking2 = ["docB", "docD", "docA"]
+
+    fused = reciprocal_rank_fusion([ranking1, ranking2], k=60)
+
+    assert len(fused) == 4
+    assert fused[0][0] == "docB"
+    assert fused[1][0] == "docA"
+    
+    scores = dict(fused)
+    assert scores["docB"] > scores["docA"]
+    assert scores["docA"] > scores["docC"]
+    assert scores["docA"] > scores["docD"]
