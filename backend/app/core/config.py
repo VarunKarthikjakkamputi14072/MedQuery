@@ -25,6 +25,17 @@ class Settings(BaseSettings):
     openai_embedding_model: str = "text-embedding-3-small"
     openai_chat_model: str = "gpt-4o-mini"
 
+    # Route LLM + embeddings through Transit — my self-built AI gateway — instead
+    # of calling OpenAI directly. When set, MedQuery uses one metered, cached af_
+    # key: repeated questions and re-embeds come straight from Transit's Redis
+    # cache, so I stop paying twice for the same call. Off by default (keeps the
+    # direct OpenAI path). Transit is OpenAI-compatible, so this is a base_url swap.
+    transit_base_url: str = ""  # e.g. https://apiforge-jnwp.onrender.com/api/v1
+    transit_api_key: str = ""   # af_... key from the Transit portal
+    transit_chat_model: str = "meta/llama-3.3-70b-instruct"
+    transit_embedding_model: str = "nvidia/nv-embedqa-e5-v5"
+    transit_embedding_dim: int = 1024
+
     groq_api_key: str = ""
     groq_chat_model: str = "llama-3.3-70b-versatile"
 
@@ -66,6 +77,15 @@ class Settings(BaseSettings):
 
     # --- Per-provider resolution (single source of truth for the factories) ---
     @property
+    def use_transit(self) -> bool:
+        """Route LLM + embeddings through the Transit gateway when configured."""
+        return (
+            not self.use_fake_providers
+            and bool(self.transit_base_url)
+            and bool(self.transit_api_key)
+        )
+
+    @property
     def use_real_openai(self) -> bool:
         """Real OpenAI embeddings + chat when a key is set and fakes aren't forced."""
         return not self.use_fake_providers and bool(self.openai_api_key)
@@ -77,9 +97,11 @@ class Settings(BaseSettings):
 
     @property
     def active_llm_provider(self) -> str:
-        """Which LLM backend will be used: groq > openrouter > openai > fake."""
+        """Which LLM backend will be used: transit > groq > openrouter > openai > fake."""
         if self.use_fake_providers:
             return "fake"
+        if self.use_transit:
+            return "transit"
         if self.groq_api_key:
             return "groq"
         if self.openrouter_api_key:
@@ -90,8 +112,14 @@ class Settings(BaseSettings):
 
     def provider_status(self) -> dict:
         """Which backend each provider is currently using (for /health + debugging)."""
+        if self.use_transit:
+            embeddings = "transit"
+        elif self.use_real_openai:
+            embeddings = "openai"
+        else:
+            embeddings = "fake"
         return {
-            "embeddings": "openai" if self.use_real_openai else "fake",
+            "embeddings": embeddings,
             "llm": self.active_llm_provider,
             "vector_store": "pinecone" if self.use_real_pinecone else "in-memory",
         }

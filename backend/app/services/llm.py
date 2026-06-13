@@ -129,6 +129,15 @@ def get_chat_provider() -> ChatProvider:
     settings = get_settings()
     provider = settings.active_llm_provider
 
+    if provider == "transit":
+        # Route chat through Transit (NVIDIA NIM, metered + cached). One af_ key
+        # fronts both chat and embeddings; repeated questions hit Transit's cache.
+        return OpenAICompatibleChatProvider(
+            api_key=settings.transit_api_key,
+            model=settings.transit_chat_model,
+            base_url=settings.transit_base_url,
+            label="transit.chat",
+        )
     if provider == "groq":
         return OpenAICompatibleChatProvider(
             api_key=settings.groq_api_key,

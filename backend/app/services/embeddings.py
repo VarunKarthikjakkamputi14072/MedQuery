@@ -42,15 +42,27 @@ class FakeEmbeddingProvider:
 
 
 class OpenAIEmbeddingProvider:
-    """Wraps the OpenAI embeddings endpoint with exponential backoff."""
+    """Wraps any OpenAI-compatible embeddings endpoint with exponential backoff.
+
+    `base_url` lets it point at a compatible gateway (e.g. Transit, which proxies
+    NVIDIA NIM embeddings and caches identical inputs). `dimension` is per-model.
+    """
 
     dimension = EMBEDDING_DIM
 
-    def __init__(self, api_key: str, model: str) -> None:
+    def __init__(
+        self,
+        api_key: str,
+        model: str,
+        base_url: str | None = None,
+        dimension: int | None = None,
+    ) -> None:
         from openai import AsyncOpenAI
 
-        self._client = AsyncOpenAI(api_key=api_key)
+        self._client = AsyncOpenAI(api_key=api_key, base_url=base_url)
         self._model = model
+        if dimension is not None:
+            self.dimension = dimension
 
     async def embed(self, texts: List[str]) -> List[List[float]]:
         if not texts:
@@ -67,6 +79,14 @@ class OpenAIEmbeddingProvider:
 
 def get_embedding_provider() -> EmbeddingProvider:
     settings = get_settings()
+    if settings.use_transit:
+        # Route embeddings through Transit (NVIDIA NIM, content-hash cached).
+        return OpenAIEmbeddingProvider(
+            settings.transit_api_key,
+            settings.transit_embedding_model,
+            base_url=settings.transit_base_url,
+            dimension=settings.transit_embedding_dim,
+        )
     if not settings.use_real_openai:
         return FakeEmbeddingProvider()
     return OpenAIEmbeddingProvider(settings.openai_api_key, settings.openai_embedding_model)
