@@ -1,41 +1,141 @@
 # MedQuery — Clinical Document Intelligence
 
-A full-stack RAG (retrieval augmented generation) system for clinical
-documents. Upload discharge summaries, lab reports, clinical notes, and
-radiology reports; MedQuery extracts text, chunks it, embeds it into a
-vector store, mines medical entities, and answers grounded clinical
-questions with source citations, latency / confidence tracking, and a
-high-risk content banner.
+**Clinical questions get answered from the wrong chunk when retrieval is
+semantic-only — MedQuery fuses lexical and vector search so exact terms like
+"HbA1c" land the chunk that actually contains the value, and measures that it
+worked.**
 
-Retrieval is **hybrid** — vector similarity fused with a BM25 lexical arm — and
-there's an **evaluation harness** that measures it, so "grounded, low-hallucination"
-is something I can put numbers behind rather than just claim. See
-[Retrieval design](#retrieval-design) and [Evaluation](#evaluation).
+A full-stack RAG system for clinical documents: upload discharge summaries, lab
+reports, clinical notes and radiology reports; MedQuery extracts text, chunks it,
+embeds it, mines medical entities, and answers grounded questions with source
+citations, latency/confidence tracking, and a high-risk content banner.
+
+---
 
 ## Architecture
 
-```
-Next.js 14 + Tailwind (frontend)
-        │
-        ▼
-FastAPI backend (async)
-        │
-        ├──► Local filesystem (mock S3) for uploaded PDFs/TXT
-        ├──► PostgreSQL (documents, sessions, queries, entities, chunks)
-        ├──► LangChain RecursiveCharacterTextSplitter (512 / 50 tokens)
-        ├──► spaCy / scispaCy en_core_sci_sm (+ regex fallback)  → entities
-        ├──► OpenAI text-embedding-3-small (embeddings, with retries)
-        ├──► Pinecone serverless index "medquery" (batched upserts ≤100)
-        ├──► Hybrid retrieval: vector (Pinecone) + BM25 lexical, fused with RRF
-        └──► OpenAI gpt-4o-mini (multi-turn, with retries)
+```mermaid
+flowchart TB
+    ui["Next.js 14 + Tailwind"] --> api["FastAPI backend (async)"]
+    api -- "PDF / TXT" --> fs[("filesystem<br/>mock S3")]
+    api -- "chunk 512/50" --> split["LangChain<br/>RecursiveCharacterTextSplitter"]
+    split --> pg[("PostgreSQL<br/>documents · chunks · entities<br/>sessions · queries")]
+    split -- "embed" --> emb["OpenAI<br/>text-embedding-3-small"]
+    emb --> pc[("Pinecone<br/>serverless index")]
+    api -- "entities" --> ner["spaCy / scispaCy<br/>(regex fallback)"]
+    ner --> pg
+
+    q(["question"]) --> hyb["hybrid retrieval"]
+    pc -- "vector arm" --> hyb
+    pg -- "BM25 lexical arm" --> hyb
+    hyb -- "Reciprocal Rank Fusion" --> dedupe["dedupe by content hash"]
+    dedupe --> llm["OpenAI gpt-4o-mini<br/>+ risk flagging"]
+    llm --> ans(["answer + citations"])
+
+    classDef store fill:#fff3cd,stroke:#d39e00,color:#333;
+    classDef svc fill:#d4edda,stroke:#28a745,color:#333;
+    class fs,pg,pc store;
+    class ui,api,split,emb,ner,hyb,dedupe,llm svc;
 ```
 
-The embedding provider, vector store, and chat LLM all have **drop-in
-fakes** that activate automatically when no API key is configured
-(`USE_FAKE_PROVIDERS=true` by default). The entity extractor falls back
-to a deterministic regex/keyword backend when scispaCy isn't installed.
-This means the full pipeline runs end-to-end locally with zero external
-dependencies and is fully covered by integration tests.
+The embedding provider, vector store, and chat LLM all have **drop-in fakes** that
+activate automatically when no API key is configured (`USE_FAKE_PROVIDERS=true` by
+default), so the full pipeline runs end-to-end offline and is covered by
+integration tests.
+
+---
+
+## The key design decision: hybrid retrieval fused with RRF
+
+**The alternative I rejected:** pure vector similarity — embed the question, take
+the nearest chunks. It's the default RAG recipe and it handles paraphrasing well.
+
+**Why it loses on clinical text:** clinical documents are dense with exact tokens
+that carry the entire meaning — `HbA1c`, `creatinine`, `troponin`, dosages, ICD
+codes. Embeddings compress those into a semantic neighbourhood where "HbA1c" sits
+close to "blood glucose," "diabetes panel," and "A1C trend." Ask for a specific
+value and a semantically-related chunk can outrank the one that literally
+contains it. In a clinical setting a confidently-cited *near-miss* is worse than
+no answer.
+
+**The second alternative I rejected:** run both arms and blend the scores with a
+weight. This breaks because cosine similarity and BM25 aren't on the same scale
+or distribution — any fixed weight is a magic number tuned to one corpus, and it
+silently stops being right when the corpus changes.
+
+**What MedQuery does instead:** run both arms and fuse with **Reciprocal Rank
+Fusion**, which consumes only the *rank* each arm assigns, never the raw score.
+Nothing needs normalising, there is no weight to tune, and a chunk that ranks
+well in either arm surfaces. To make the lexical arm possible, chunk text is
+persisted to a `chunks` table keyed `{document_id}:{index}` — the same id used as
+the vector id — so the two arms fuse on a shared key.
+
+**What it costs, honestly:** a second retrieval path and a `chunks` table to keep
+in sync with the vector store, plus BM25 as a pure-Python implementation that
+will not scale to a large corpus (the next step there is Postgres `to_tsvector` /
+`ts_rank`). Toggle with `USE_HYBRID_RETRIEVAL=false`.
+
+---
+
+## Measured result
+
+A RAG system is only as good as its retrieval, so there's a harness that measures
+it instead of relying on vibes (`backend/eval/`). It ingests a labeled fixture set
+(`eval/fixtures.json` — synthetic clinical documents, each question tagged with
+the gold chunk it should retrieve) and reports **recall@k** and **MRR@k** for all
+three modes. Reproduced **2026-08-05**:
+
+```bash
+cd backend && python -m eval.run_eval
+```
+
+| Mode (k=5) | recall@k | MRR@k |
+|---|---|---|
+| vector only | 0.750 | 0.408 |
+| lexical only | 0.833 | 0.625 |
+| **hybrid (RRF)** | **0.917** | **0.694** |
+
+Hybrid beats the better single arm by **+8.4 pts recall** and **+6.9 pts MRR**.
+
+**One honest caveat:** the default fake embedding provider is hash-based, not
+semantic, so the **vector** row is effectively a random baseline. This table shows
+the lexical arm recovering exact terms and fusion improving on both — it is *not*
+evidence that hybrid beats a real semantic embedder. For that, set
+`OPENAI_API_KEY` and `USE_FAKE_PROVIDERS=false`; the harness uses whatever
+provider is configured. `test_retrieval.py` asserts hybrid recall never drops
+below vector-only, so CI guards the regression.
+
+---
+
+## Run it in under 2 minutes
+
+```bash
+cd backend
+python3 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+cp .env.example .env          # USE_FAKE_PROVIDERS=true by default
+uvicorn app.main:app --reload
+```
+
+No Postgres, Pinecone, or API key needed — the fakes make the whole pipeline run
+offline. API docs at **http://localhost:8000/docs**. For the UI:
+
+```bash
+cd frontend && cp .env.example .env.local && npm install && npm run dev
+```
+
+Or the whole thing at once: `cp .env.example .env && docker compose up --build`
+(frontend :3000, backend :8000, Postgres :5432).
+
+To use real providers, set `USE_FAKE_PROVIDERS=false` with `OPENAI_API_KEY` and
+`PINECONE_API_KEY`. For real scispaCy entity extraction:
+
+```bash
+pip install spacy==3.7.5
+pip install https://s3-us-west-2.amazonaws.com/ai2-s2-scispacy/releases/v0.5.4/en_core_sci_sm-0.5.4.tar.gz
+```
+
+---
 
 ## Repository layout
 
@@ -99,64 +199,21 @@ Models work against both Postgres (production) and SQLite (tests).
 6. **CORS** — FastAPI `CORSMiddleware` configured for
    `http://localhost:3000` (configurable via `CORS_ORIGINS`).
 
-### Retrieval design
+### Retrieval design — the mechanics
 
-Early on, retrieval was pure vector similarity. That works for paraphrased
-questions but falls down on the things clinical text is full of — exact terms,
-acronyms, and numbers. Ask for "HbA1c" or "creatinine" and a semantic match can
-float a loosely-related chunk above the one that literally contains the value.
-
-So retrieval is now **hybrid**:
+The rationale is [above](#the-key-design-decision-hybrid-retrieval-fused-with-rrf);
+the three stages are:
 
 1. **Vector arm** — embed the question, pull the nearest chunks from the vector
    store (Pinecone, or the in-memory cosine store in fake mode).
 2. **Lexical arm** — a BM25 search over the chunk text persisted in Postgres
    (`app/services/lexical.py`). This is what catches the exact-term cases.
-3. **Fusion** — the two rankings are combined with **Reciprocal Rank Fusion**
-   (`app/services/fusion.py`). RRF doesn't need the cosine and BM25 scores to be
-   on the same scale, which is the whole problem with naively mixing them; it just
-   rewards chunks that rank well in either list.
+3. **Fusion** — the two rankings are combined with Reciprocal Rank Fusion
+   (`app/services/fusion.py`), which consumes ranks rather than scores.
 
-To make the lexical arm possible, chunk text is now persisted to a `chunks` table
-during `/embed` (it used to live only in the vector metadata). The chunk id is
-`{document_id}:{index}` — the same id used as the vector id — so the two arms fuse
-on a shared key. Hybrid is on by default and can be toggled with
-`USE_HYBRID_RETRIEVAL=false`.
 
-The BM25 implementation is a compact pure-Python one so the lexical arm stays
-portable and dependency-free (and runs in tests on SQLite). For a larger corpus
-the natural next step is Postgres full-text search (`to_tsvector`/`ts_rank`).
-
-### Evaluation
-
-A RAG system is only as good as its retrieval, so there's a small harness that
-measures it instead of relying on vibes (`backend/eval/`). It ingests a labeled
-fixture set (`eval/fixtures.json` — synthetic clinical documents with questions
-and the gold chunk each should retrieve) and reports **recall@k** and **MRR@k**
-for three modes: vector-only, lexical-only, and hybrid.
-
-```bash
-cd backend
-python -m eval.run_eval
-```
-
-Example output (k=5):
-
-```
-mode          recall@k     MRR@k
---------------------------------
-vector           0.750     0.408
-lexical          0.833     0.625
-hybrid           0.917     0.694
-```
-
-One honest caveat: the default fake embedding provider is hash-based, not
-semantic, so the **vector** row above is effectively a random baseline — the table
-mainly shows the lexical arm recovering exact terms and the fusion improving on
-both. For real semantic numbers, set `OPENAI_API_KEY` and `USE_FAKE_PROVIDERS=false`
-before running; the harness uses whatever provider is configured. `test_retrieval.py`
-asserts hybrid recall never drops below vector-only, so CI guards against
-regressions.
+The numbers and methodology are in [Measured result](#measured-result) above.
+The harness lives in `backend/eval/` and writes `eval/results.json`.
 
 What I'd improve next: a calibrated or groundedness-based confidence score (the
 current one is the average cosine of the cited chunks), and an optional
@@ -167,25 +224,6 @@ cross-encoder reranker on top of the fused candidates.
 FastAPI · SQLAlchemy 2.0 (async) · PostgreSQL · asyncpg · LangChain ·
 Pinecone · PyPDF2 · OpenAI · spaCy / scispaCy (optional) ·
 pydantic-settings · python-dotenv · pytest-asyncio.
-
-### Running locally
-
-```bash
-cd backend
-python3 -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
-cp .env.example .env   # USE_FAKE_PROVIDERS=true by default
-uvicorn app.main:app --reload
-```
-
-To use the real providers, set `USE_FAKE_PROVIDERS=false` and provide
-`OPENAI_API_KEY` plus `PINECONE_API_KEY` in `.env`. To enable real
-scispaCy entity extraction:
-
-```bash
-pip install spacy==3.7.5
-pip install https://s3-us-west-2.amazonaws.com/ai2-s2-scispacy/releases/v0.5.4/en_core_sci_sm-0.5.4.tar.gz
-```
 
 ### Tests & CI
 
